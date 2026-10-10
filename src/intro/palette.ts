@@ -22,8 +22,8 @@ export const C = {
   hat: '#dfe2e5',
   /** precast letter material before it resolves to white */
   /** freshly cast material, before it cures, and the joints between lifts */
-  wet: '#6b7076',
-  joint: '#7e8389',
-  materialTop: '#b9bdc1',
-  materialBottom: '#a3a8ad',
+  wet: '#62676d',
+  joint: '#767b81',
+  materialTop: '#a7abb0',
+  materialBottom: '#92979c',
 } as const;

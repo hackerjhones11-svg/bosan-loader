@@ -9,13 +9,15 @@ import { POSES, handOf, makeWorker, renderWorker, type PoseName, type WorkerEls,
 /**
  * One coordinated timeline, in seconds at the base 12 s duration.
  *
- *   0.0 – 1.2   black
- *   1.2 – 2.6   setting out: station, baseline, ticks, formwork; crane L erects
- *   2.6 – 8.0   structure rises; crane L sets the B bowls and the A crossbar;
- *               curves completed; crane R erects; the truck brings the H bar
- *   6.3 – 8.9   hero: the H crossbar is lifted across HILLS and set
- *   8.9 – 9.9   letters resolve to white; equipment and guides withdraw
- *   9.9 – 10.75 the name alone on black
+ *   0.0 – 1.2    black
+ *   1.2 – 2.6    setting out: station, baseline, ticks, formwork; crane L erects
+ *   2.6 – 7.9    structure is cast in lifts; crane L sets the B bowls (5.2) and
+ *                the A crossbar (7.1); curves are completed; crane R erects and
+ *                the truck reverses in with the H crossbar
+ *   5.9 – 8.5    hero: the H crossbar is lifted across HILLS and set (8.5)
+ *   8.5 – 9.6    letters resolve to white; crew, equipment and guides withdraw
+ *   9.6 – 10.7   the name alone on black
+ *  10.7 – 12.0   handoff (owned by BosanIntro)
  *
  * The construction timeline ends at HOLD_END. The handoff (black opening into
  * the presentation) is a separate short timeline owned by the component, so
@@ -465,7 +467,6 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   const aBar = comps.aBar;
   const hBar = comps.hBar;
 
-
   // ── 1.2 – 2.6  setting out ──────────────────────────────────────────
   const station = q('station');
   at(1.22, station, { opacity: 1, duration: 0.55, ease: 'sine.out' });
@@ -636,8 +637,6 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   at(heroLower, hBar.st, { dy: -30, duration: 0.46, ease: 'power2.out' });
   pose('scaffold', 'reachUp', heroLower + 0.08, 0.42);
   at(heroLower + 0.14, tags.hBar.st, { held: 0, on: 0, duration: 0.3, ease: 'sine.inOut' });
-  // a short alignment hold in near silence, then the final set
-  const heroSet = heroLower + 0.46 + 0.24;
   // the rest of the site quietens so the eye settles on the H
   const quiet = [q('craneL'), q('hookL'), q('laydown'), station, shore];
   at(heroLower - 0.25, quiet, { opacity: 0.45, duration: 0.6, ease: 'sine.inOut' });
@@ -645,6 +644,8 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
     if (id === 'surveyor' && !site.station.surveyor) continue;
     at(heroLower - 0.25, workers[id], { opacity: 0.45, duration: 0.6, ease: 'sine.inOut' });
   }
+  // a short alignment hold in near silence, then the final set
+  const heroSet = heroLower + 0.46 + 0.24;
   at(heroSet, hBar.st, { dy: 0, duration: 0.28, ease: 'sine.inOut' });
   const contact = heroSet + 0.28;
   tl.addLabel('hero-set', contact);
