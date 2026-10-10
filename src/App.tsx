@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BosanIntro, type BosanIntroCompleteInfo } from './intro';
+import { BosanIntro } from './intro';
 import { OpeningPlaceholder } from './opening/OpeningPlaceholder';
 
 /**
- * Preview harness. Query parameters for review:
+ * Preview harness. Reload the page to replay the introduction.
+ * Query parameters for review:
  *   ?assets=4000   simulate presentation assets that take 4 s to load
  *   ?assets=never  simulate assets that never load (bounded fallback)
  *   ?duration=14   change the overall intro length (seconds)
@@ -16,9 +17,7 @@ function useParams() {
 
 export default function App() {
   const params = useParams();
-  const [introRun, setIntroRun] = useState(0);
   const [introActive, setIntroActive] = useState(true);
-  const [revealed, setRevealed] = useState(false);
   const [assetsReady, setAssetsReady] = useState(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const pageRef = useRef<HTMLDivElement>(null);
@@ -28,8 +27,8 @@ export default function App() {
     if (pageRef.current) pageRef.current.inert = introActive;
   }, [introActive]);
 
-  // The placeholder needs only its fonts; real presentations add their own
-  // images, data, etc. here. Readiness never alters the cinematic timeline.
+  // The opening screen needs nothing beyond its fonts; a real presentation
+  // reports its own images and data here. Readiness never alters the timeline.
   useEffect(() => {
     let cancelled = false;
     const simulated = params.get('assets');
@@ -42,18 +41,9 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [params, introRun]);
+  }, [params]);
 
-  const onComplete = useCallback((_info: BosanIntroCompleteInfo) => {
-    setIntroActive(false);
-  }, []);
-
-  const replay = useCallback(() => {
-    window.scrollTo(0, 0);
-    setRevealed(false);
-    setIntroActive(true);
-    setIntroRun((r) => r + 1);
-  }, []);
+  const onComplete = useCallback(() => setIntroActive(false), []);
 
   const duration = Number(params.get('duration')) || undefined;
   const reduced = params.get('reduced') === '1' ? true : undefined;
@@ -61,20 +51,13 @@ export default function App() {
   return (
     <>
       <div ref={pageRef}>
-        <OpeningPlaceholder
-          ref={headingRef}
-          introActive={introActive}
-          revealed={revealed || !introActive}
-          onReplay={replay}
-        />
+        <OpeningPlaceholder ref={headingRef} introActive={introActive} />
       </div>
       {introActive && (
         <BosanIntro
-          key={introRun}
           assetsReady={assetsReady}
           duration={duration}
           reducedMotion={reduced}
-          onReveal={() => setRevealed(true)}
           onComplete={onComplete}
           focusTargetRef={headingRef}
           debug={params.has('debug')}

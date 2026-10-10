@@ -4,25 +4,24 @@ import type { Frame } from './frame';
 
 interface GlyphsProps {
   mode: LayoutMode;
-  fill?: string;
-  /** adds data-glyph attributes so a timeline can address each letter */
+  /** adds data-glyph attributes and starts each letter hidden, for the intro to reveal */
   addressable?: boolean;
-  /** initial opacity of each letter (the intro starts them hidden) */
-  opacity?: number;
 }
 
+const HIDDEN = { opacity: 0 };
+
 /** The finished BOSAN HILLS letterforms, flat and front-facing. */
-export function WordmarkGlyphs({ mode, fill = '#FFFFFF', addressable, opacity }: GlyphsProps) {
+export function WordmarkGlyphs({ mode, addressable }: GlyphsProps) {
   const wm = WORDMARKS[mode];
   return (
-    <g fill={fill}>
+    <g fill="#FFFFFF">
       {GLYPH_ORDER.map((key: GlyphKey) => {
         const g = wm.glyphs[key];
         return (
           <path
             key={key}
             data-glyph={addressable ? key : undefined}
-            opacity={opacity}
+            style={addressable ? HIDDEN : undefined}
             transform={`translate(${g.x} ${g.y})`}
             d={glyphPath(key)}
           />
@@ -37,6 +36,12 @@ interface WordmarkSvgProps {
   className?: string;
   /** accessible name; omit to mark the artwork decorative */
   label?: string;
+  /**
+   * Intro use: letters start hidden and sit in a group the timeline can move
+   * with its camera. Once the intro settles it clears both, leaving markup
+   * identical to the opening screen's so the two render the same pixels.
+   */
+  intro?: boolean;
 }
 
 /**
@@ -44,9 +49,10 @@ interface WordmarkSvgProps {
  * intro. The opening screen renders this so the title never shifts at handoff.
  */
 export const WordmarkSvg = forwardRef<SVGSVGElement, WordmarkSvgProps>(function WordmarkSvg(
-  { frame, className, label },
+  { frame, className, label, intro },
   ref,
 ) {
+  const glyphs = <WordmarkGlyphs mode={frame.mode} addressable={intro} />;
   return (
     <svg
       ref={ref}
@@ -61,7 +67,7 @@ export const WordmarkSvg = forwardRef<SVGSVGElement, WordmarkSvgProps>(function 
       focusable="false"
       shapeRendering="geometricPrecision"
     >
-      <WordmarkGlyphs mode={frame.mode} />
+      {intro ? <g data-k="final-camera">{glyphs}</g> : glyphs}
     </svg>
   );
 });

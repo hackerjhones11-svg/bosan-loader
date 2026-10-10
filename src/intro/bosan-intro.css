@@ -15,7 +15,8 @@
   position: absolute;
   inset: 0;
   background: #000;
-  will-change: opacity, mask-image;
+  /* no will-change: promoting this layer changes how the wordmark above it
+     is anti-aliased, and the handoff must be pixel-identical */
 }
 
 .bosan-intro__name {

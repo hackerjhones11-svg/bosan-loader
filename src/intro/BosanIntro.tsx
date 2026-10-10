@@ -113,6 +113,7 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
   const rootRef = useRef<HTMLDivElement>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SVGSVGElement>(null);
+  const finalRef = useRef<SVGSVGElement>(null);
   const quietRef = useRef<SVGSVGElement>(null);
   const skipRef = useRef<HTMLButtonElement>(null);
 
@@ -138,8 +139,9 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
   useLayoutEffect(() => {
     if (reduced) return;
     const svg = sceneRef.current;
-    if (!svg) return;
-    const intro = createIntroTimeline(svg, frame);
+    const finalSvg = finalRef.current;
+    if (!svg || !finalSvg) return;
+    const intro = createIntroTimeline(svg, finalSvg, frame);
     introRef.current = intro;
     intro.tl.timeScale(timeScale);
     intro.tl.eventCallback('onComplete', () => setPhase((p) => (p === 'playing' ? 'holding' : p)));
@@ -194,7 +196,12 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     const svg = quietRef.current;
     if (!svg) return;
     const tl = gsap.timeline({ onComplete: () => setPhase((p) => (p === 'playing' ? 'holding' : p)) });
-    tl.fromTo(svg, { opacity: 0 }, { opacity: 1, duration: REDUCED.fadeIn, ease: 'sine.out' }, 0.3);
+    tl.fromTo(
+      svg,
+      { opacity: 0 },
+      { opacity: 1, duration: REDUCED.fadeIn, ease: 'sine.out', clearProps: 'opacity' },
+      0.3,
+    );
     tl.to({}, { duration: REDUCED.hold });
     return () => {
       tl.kill();
@@ -369,7 +376,11 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
         {reduced ? (
           <WordmarkSvg key={`q${run}`} ref={quietRef} frame={frame} className="bosan-intro__scene" />
         ) : (
-          <IntroScene key={`${frame.mode}-${run}`} ref={sceneRef} frame={frame} />
+          <>
+            {/* the finished name, beneath the construction that resolves into it */}
+            <WordmarkSvg key={`w${frame.mode}-${run}`} ref={finalRef} frame={frame} className="bosan-intro__scene" intro />
+            <IntroScene key={`${frame.mode}-${run}`} ref={sceneRef} frame={frame} />
+          </>
         )}
       </div>
       {skippable && !reduced && (

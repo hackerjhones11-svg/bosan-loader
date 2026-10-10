@@ -5,7 +5,6 @@ import { GLYPH_ORDER, WORDMARKS, charOf, glyphPath, type GlyphKey } from '../lay
 import { C } from '../palette';
 import { H_BAR, O_SPINE, REGIONS, S_SPINE, polyPath, type RegionId } from '../parts';
 import { SITES, TRUCK } from '../site';
-import { WordmarkGlyphs } from '../Wordmark';
 import { Crane, HookRig } from './Crane';
 import { Truck } from './Truck';
 
@@ -182,7 +181,7 @@ export const IntroScene = forwardRef<SVGSVGElement, Props>(function IntroScene({
             const spine = SPINE[k];
             const d = glyphPath(k);
             return (
-              <g key={k} transform={tr(k)}>
+              <g key={k} transform={tr(k)} data-k={`letters-${k}`}>
                 {region !== undefined && (
                   <g clipPath={region ? url(`region-${region}`) : undefined}>
                     {/* fresh pour: darker until it cures */}
@@ -230,11 +229,6 @@ export const IntroScene = forwardRef<SVGSVGElement, Props>(function IntroScene({
               ))}
             </g>
           ))}
-        </g>
-
-        {/* ── the finished letters: flat white, resolved at the end ── */}
-        <g data-k="final">
-          <WordmarkGlyphs mode={mode} addressable opacity={0} />
         </g>
 
         {/* ── level lines for the two precision placements: the piece's top

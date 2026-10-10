@@ -98,7 +98,13 @@ export interface IntroTimeline {
   render: () => void;
 }
 
-export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTimeline {
+/**
+ * @param svg      the construction scene
+ * @param finalSvg the finished wordmark, drawn beneath the scene in its own
+ *                 plain SVG so that, once settled, it renders exactly like the
+ *                 opening screen's title
+ */
+export function createIntroTimeline(svg: SVGSVGElement, finalSvg: SVGSVGElement, frame: Frame): IntroTimeline {
   const site = SITES[frame.mode];
   const wm = site.wordmark;
   const g = wm.glyphs;
@@ -258,7 +264,8 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   const truckBody = q('truck-body');
   const wheels = qa<SVGGElement>('[data-k="truck-wheel"]');
   const finals = {} as Record<GlyphKey, SVGPathElement>;
-  for (const k of GLYPH_ORDER) finals[k] = svg.querySelector(`[data-glyph="${k}"]`) as SVGPathElement;
+  for (const k of GLYPH_ORDER) finals[k] = finalSvg.querySelector(`[data-glyph="${k}"]`) as SVGPathElement;
+  const finalCamera = finalSvg.querySelector('[data-k="final-camera"]') as SVGGElement;
 
   // ───────────────────────────── render ─────────────────────────────
 
@@ -332,10 +339,15 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   function render() {
     const cx = wm.cx;
     const cy = wm.cy;
-    cameraEl.setAttribute(
-      'transform',
-      `translate(${f(cx)} ${f(cy)}) scale(${camera.s.toFixed(5)}) translate(${f(-camera.fx)} ${f(-camera.fy)})`,
-    );
+    const settled = camera.s === 1 && camera.fx === cx && camera.fy === cy;
+    if (settled) {
+      cameraEl.removeAttribute('transform');
+      finalCamera.removeAttribute('transform');
+    } else {
+      const t = `translate(${f(cx)} ${f(cy)}) scale(${camera.s.toFixed(5)}) translate(${f(-camera.fx)} ${f(-camera.fy)})`;
+      cameraEl.setAttribute('transform', t);
+      finalCamera.setAttribute('transform', t);
+    }
 
     truckRoot.setAttribute('transform', `translate(${f(truck.x)} ${f(site.truck.y)})`);
     truckBody.setAttribute('transform', `rotate(${truck.pitch.toFixed(3)} ${TRUCK.axles[1]} ${-TRUCK.wheelR})`);
@@ -681,13 +693,20 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   at(contact + 0.35, camera, { s: 1, fx: wm.cx, fy: wm.cy, duration: HOLD_START - contact - 0.35, ease: 'sine.inOut' });
 
   // ── resolve: precast surfaces become the finished white letters ─────
+  // The white wordmark lies beneath the scene; each precast letter fades
+  // away above it, spreading out from the H. Crew and equipment keep their
+  // place in front of the letters while they withdraw.
   const resolveAt = contact + 0.06;
   const hx = g.H.x + 380;
   for (const k of GLYPH_ORDER) {
     const dist = Math.abs(g[k].x + 300 - hx) / Math.max(1, wm.width);
-    at(resolveAt + dist * 0.45, finals[k], { opacity: 1, duration: 0.55, ease: 'sine.inOut' });
+    const t = resolveAt + dist * 0.45;
+    set(t, finals[k], { opacity: 1 });
+    at(t, q(`letters-${k}`), { opacity: 0, duration: 0.55, ease: 'sine.inOut' });
+    if (k === 'H') at(t, hBar.st, { opacity: 0, duration: 0.55, ease: 'sine.inOut' });
   }
-  at(resolveAt + 0.45, hBar.st, { opacity: 0, duration: 0.25, ease: 'sine.inOut' });
+  // the settled wordmark carries no inline styles: identical to the opening screen's
+  set(HOLD_START, Object.values(finals), { clearProps: 'opacity' });
   const formwork = q('formwork');
   at(resolveAt + 0.05, formwork, { opacity: 0, duration: 0.55, ease: 'sine.inOut' });
 

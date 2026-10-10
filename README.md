@@ -1,8 +1,8 @@
 # BOSAN HILLS — opening sequence
 
 A standalone React + Vite app containing the construction‑themed introduction
-for the BOSAN HILLS presentation, a restrained placeholder opening screen, and
-a Replay intro control.
+for the BOSAN HILLS presentation. When it ends, the page is the BOSAN HILLS
+wordmark alone on pure black.
 
 From black, a miniature site is set out. A surveyor's station throws the
 baseline, and two tower cranes, a small truck and a crew of five assemble the
@@ -16,7 +16,8 @@ name from the real letterforms of Cormorant Garamond Medium:
   quiet placement.
 
 The letters then resolve into a flat white wordmark, the equipment withdraws,
-the name holds on black, and the black opens onto the presentation.
+and the name remains on black. The intro's final frame and the page beneath it
+render the name pixel‑identically, so the handoff is invisible.
 
 ## Run it
 
@@ -33,8 +34,7 @@ runtime.
 
 ### Reviewing
 
-- **Replay intro** (bottom left of the opening screen) plays the complete
-  introduction again from black.
+- **Reload the page** to play the complete introduction again from black.
 - **Skip intro** appears bottom right after the opening black (also **Esc**).
 - Query parameters for review:
 
@@ -122,7 +122,7 @@ src/
     layout.ts          tracking, optical pair spacing, one‑ and two‑line settings
     frame.ts           shared placement of the wordmark for intro and opening screen
     glyphData.ts       generated outlines (npm run glyphs)
-  opening/             placeholder opening screen
+  opening/             the opening screen: the wordmark alone on black
 scripts/extract-glyphs.mjs   regenerates glyphData.ts from the bundled font
 ```
 
