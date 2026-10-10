@@ -1,0 +1,65 @@
+.bosan-intro {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  overflow: hidden;
+  contain: strict;
+  pointer-events: auto;
+}
+
+.bosan-intro--done {
+  pointer-events: none;
+}
+
+.bosan-intro__backdrop {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  will-change: opacity, mask-image;
+}
+
+.bosan-intro__name {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.bosan-intro__scene {
+  position: absolute;
+  inset: 0;
+  display: block;
+  overflow: visible;
+}
+
+.bosan-intro__skip {
+  position: absolute;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: max(22px, env(safe-area-inset-bottom));
+  padding: 10px 2px;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+  font: 400 11px/1 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.6s ease, color 0.25s ease, visibility 0s linear 0.6s;
+}
+
+.bosan-intro__skip.is-visible {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.6s ease, color 0.25s ease, visibility 0s;
+}
+
+.bosan-intro__skip:hover,
+.bosan-intro__skip:focus-visible {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.bosan-intro__skip:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.55);
+  outline-offset: 4px;
+}
