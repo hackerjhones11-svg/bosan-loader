@@ -1,4 +1,3 @@
-import type { GlyphKey } from './layout';
 
 /**
  * Component regions in glyph-local coordinates (y down, baseline 0). Each
@@ -32,9 +31,13 @@ export const A_BAR: Poly = [
 
 export const H_BAR = { x0: 197, x1: 562, y0: -337, y1: -314 };
 
+/** Cuts sit just inside the counters so no sliver of a stem edge travels with a piece. */
+const B_CUT = 205.5;
+const H_CUT = { x0: H_BAR.x0 + 0.6, x1: H_BAR.x1 - 0.6 };
+
 export const REGIONS = {
-  'B-stem': [rect(-FAR, -FAR, 204, FAR)],
-  'B-bowls': [rect(204, -FAR, FAR, FAR)],
+  'B-stem': [rect(-FAR, -FAR, B_CUT, FAR)],
+  'B-bowls': [rect(B_CUT, -FAR, FAR, FAR)],
   'A-legs': [
     rect(-FAR, -261, FAR, FAR),
     rect(-FAR, -FAR, FAR, -283),
@@ -53,12 +56,12 @@ export const REGIONS = {
   ],
   'A-bar': [A_BAR],
   'H-uprights': [
-    rect(-FAR, -FAR, H_BAR.x0, FAR),
-    rect(H_BAR.x1, -FAR, FAR, FAR),
+    rect(-FAR, -FAR, H_CUT.x0, FAR),
+    rect(H_CUT.x1, -FAR, FAR, FAR),
     rect(-FAR, -FAR, FAR, H_BAR.y0),
     rect(-FAR, H_BAR.y1, FAR, FAR),
   ],
-  'H-bar': [rect(H_BAR.x0, H_BAR.y0, H_BAR.x1, H_BAR.y1)],
+  'H-bar': [rect(H_CUT.x0, H_BAR.y0, H_CUT.x1, H_BAR.y1)],
 } satisfies Record<string, Poly[]>;
 
 export type RegionId = keyof typeof REGIONS;
@@ -67,19 +70,7 @@ export function polyPath(polys: Poly[]): string {
   return polys.map((p) => 'M' + p.map(([x, y]) => `${x} ${y}`).join('L') + 'Z').join('');
 }
 
-/** How each letter is built. */
-export type BuildMethod =
-  | { kind: 'rise'; region?: RegionId }
-  | { kind: 'spine'; spine: string; width: number }
-  | { kind: 'lift' };
-
-/**
- * Spines for letters completed along their curve: an ellipse for the O,
- * the stroke centreline for the S (lower terminal → upper terminal).
- */
-const O_SPINE =
-  'M383 -624 A288 312 0 0 1 383 0 A288 312 0 0 1 383 -624';
-
+/** Centreline of the S, lower terminal → upper terminal, for completing it along its curve. */
 const S_SPINE_POINTS: [number, number][] = [
   [80, -205],
   [82, -175],
@@ -130,15 +121,5 @@ function smoothPath(pts: [number, number][]): string {
 
 export const S_SPINE = smoothPath(S_SPINE_POINTS);
 
-export const BUILD: Record<GlyphKey, BuildMethod[]> = {
-  B: [{ kind: 'rise', region: 'B-stem' }, { kind: 'lift' }],
-  O: [{ kind: 'spine', spine: O_SPINE, width: 150 }],
-  S1: [{ kind: 'spine', spine: S_SPINE, width: 160 }],
-  A: [{ kind: 'rise', region: 'A-legs' }, { kind: 'lift' }],
-  N: [{ kind: 'rise' }],
-  H: [{ kind: 'rise', region: 'H-uprights' }, { kind: 'lift' }],
-  I: [{ kind: 'lift' }],
-  L1: [{ kind: 'rise' }],
-  L2: [{ kind: 'rise' }],
-  S2: [{ kind: 'spine', spine: S_SPINE, width: 160 }],
-};
+/** Centreline ellipse of the O, starting at the top and running clockwise. */
+export const O_SPINE = 'M383 -624A288 312 0 0 1 383 0A288 312 0 0 1 383 -624';

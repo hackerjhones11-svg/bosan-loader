@@ -131,7 +131,7 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
         [246, -624],
         [372, -612],
       ],
-      bridle: 140,
+      bridle: 120,
       st: { dx: site.bowlsLaydown.dx, dy: site.bowlsLaydown.dy, rot: 0, truck: 0, opacity: 1 },
     },
     aBar: {
@@ -359,10 +359,11 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
 
     for (const k of Object.keys(rises) as GlyphKey[]) {
       const r = rises[k];
+      // the footing (overshoot below the baseline) appears with the first pour
       r.rect.setAttribute('y', f(-r.h));
-      r.rect.setAttribute('height', f(r.h + 40));
+      r.rect.setAttribute('height', f(r.h > 0.01 ? r.h + 24 : 0));
       r.cure.setAttribute('y', f(-r.c));
-      r.cure.setAttribute('height', f(r.c + 40));
+      r.cure.setAttribute('height', f(r.c > 0.01 ? r.c + 24 : 0));
       r.front.setAttribute('y', f(-r.h - px * 0.7));
       const op = Math.max(0, Math.min(1, r.h / 24, (r.top - r.h) / 24));
       r.front.setAttribute('opacity', (op * 0.8).toFixed(3));
@@ -533,27 +534,30 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
 
   // ── crane L · lift 1: the bowls of the B ────────────────────────────
   appear('bowls', 2.4, 0.5);
-  hookTo(L, bowlsPick, 2.75, 0.45);
-  pose('bowls', 'attach', 2.92, 0.32);
-  attach(L, 'bowls', 3.2, 0.24);
+  hookTo(L, bowlsPick, 2.66, 0.42);
+  pose('bowls', 'attach', 2.8, 0.3);
+  attach(L, 'bowls', 3.08, 0.24);
   if (!stacked) {
-    at(3.4, tags.bowls.st, { on: 1, duration: 0.18, ease: 'none' });
-    pose('bowls', 'tagHold', 3.46, 0.4);
+    at(3.28, tags.bowls.st, { on: 1, duration: 0.18, ease: 'none' });
+    pose('bowls', 'tagHold', 3.34, 0.4);
   } else {
-    pose('bowls', 'stand', 3.46, 0.4);
+    pose('bowls', 'stand', 3.34, 0.4);
   }
-  const bowlsHoist = 3.46;
-  const bowlsHoistD = stacked ? 0.95 : 0.62;
+  const bowlsHoist = 3.34;
+  // two lines: a longer hoist up to the upper level, a short traverse
+  const bowlsHoistD = stacked ? 0.86 : 0.62;
+  const bowlsTravelD = stacked ? 0.44 : 0.66;
   at(bowlsHoist, bowls.st, { dy: site.bowlsClearDy, duration: bowlsHoistD, ease: 'power2.inOut' });
   const bowlsTravel = bowlsHoist + bowlsHoistD - 0.06;
-  at(bowlsTravel, bowls.st, { dx: 0, duration: 0.74, ease: 'power2.inOut' });
-  swayDuring(L, bowlsTravel, 0.74, 1);
-  if (!stacked) walk('bowls', site.workers.bowls.walkTo, bowlsTravel + 0.02, 0.72);
-  const bowlsLower = bowlsTravel + 0.74;
-  at(bowlsLower, bowls.st, { dy: -22, duration: 0.42, ease: 'power2.out' });
-  at(bowlsLower + 0.44, bowls.st, { dy: 0, duration: 0.22, ease: 'sine.inOut' });
-  const bowlsDone = bowlsLower + 0.68;
+  at(bowlsTravel, bowls.st, { dx: 0, duration: bowlsTravelD, ease: 'power2.inOut' });
+  swayDuring(L, bowlsTravel, bowlsTravelD, 1, stacked ? 8 : 14);
+  if (!stacked) walk('bowls', site.workers.bowls.walkTo, bowlsTravel + 0.02, bowlsTravelD - 0.02);
+  const bowlsLower = bowlsTravel + bowlsTravelD;
+  at(bowlsLower, bowls.st, { dy: -22, duration: 0.4, ease: 'power2.out' });
+  at(bowlsLower + 0.42, bowls.st, { dy: 0, duration: 0.2, ease: 'sine.inOut' });
+  const bowlsDone = bowlsLower + 0.64;
   release(L, 'bowls', bowlsDone, 0.3);
+  tl.addLabel('bowls-set', bowlsDone);
   if (!stacked) {
     at(bowlsDone, tags.bowls.st, { held: 0, duration: 0.26, ease: 'sine.in' });
     at(bowlsDone + 0.16, tags.bowls.st, { on: 0, duration: 0.2, ease: 'none' });
@@ -563,13 +567,13 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   // ── crane L · lift 2: the A crossbar, raised between converging legs ─
   const aPick = hookAt(aBar, 0, A_BAR_REST_DY);
   const aGo = bowlsDone + 0.05;
-  raiseHook(L, 420, aGo, 0.38);
-  at(aGo, L.st, { trolley: aPick[0], duration: 0.8, ease: 'power2.inOut' });
-  at(aGo + 0.62, L.st, { drop: aPick[1] - L.spec.jibY, duration: 0.44, ease: 'power2.inOut' });
+  raiseHook(L, 420, aGo, 0.34);
+  at(aGo, L.st, { trolley: aPick[0], duration: 0.72, ease: 'power2.inOut' });
+  at(aGo + 0.5, L.st, { drop: aPick[1] - L.spec.jibY, duration: 0.42, ease: 'power2.inOut' });
   place('aBar', site.workers.aBar.x - 150);
   appear('aBar', 4.95, 0.45);
   walk('aBar', site.workers.aBar.x, 4.95, 0.75);
-  const aAttach = aGo + 1.08;
+  const aAttach = aGo + 0.92;
   pose('aBar', 'attach', aAttach - 0.26, 0.3);
   attach(L, 'aBar', aAttach, 0.22);
   const marksA = q('marks-A');
@@ -580,9 +584,11 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   const aDone = aAttach + 0.9;
   at(aDone, marksA, { opacity: 0, duration: 0.3, ease: 'sine.in' });
   release(L, 'aBar', aDone, 0.26);
+  tl.addLabel('a-bar-set', aDone);
   pose('aBar', 'stand', aDone + 0.02, 0.35);
-  raiseHook(L, L.spec.parkDrop + 100, aDone + 0.16, 0.42);
-  pour('A', aDone + 0.02, 642, 0.3, 0.08);
+  // the hook climbs clear of the A before its legs close the apex
+  raiseHook(L, L.spec.parkDrop + 100, aDone + 0.06, 0.45);
+  pour('A', aDone + 0.24, 642, 0.27, 0.06);
 
   // ── crane R erects; the truck reverses in with the H crossbar ───────
   const hPick = hookAt(hBar, hBarOnTruck.dx, hBarOnTruck.dy);
@@ -613,6 +619,7 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
 
   // ── hero: the H crossbar travels across and is set between the uprights
   const heroHoist = heroAttach + 0.45;
+  tl.addLabel('hero-lift', heroHoist);
   at(heroHoist, hBar.st, { dy: -(640 + 70 - 314), duration: 0.58, ease: 'power2.inOut' });
   // unloaded, the truck pulls away
   at(heroHoist + 0.62, truck, { x: site.truck.offX, duration: 1.15, ease: 'power2.in' });
@@ -640,6 +647,7 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   }
   at(heroSet, hBar.st, { dy: 0, duration: 0.28, ease: 'sine.inOut' });
   const contact = heroSet + 0.28;
+  tl.addLabel('hero-set', contact);
   at(contact, marksH, { opacity: 1, duration: 0.06, ease: 'none' });
   at(contact + 0.08, marksH, { opacity: 0, duration: 0.4, ease: 'sine.in' });
   release(R, 'hBar', contact + 0.08, 0.3);
@@ -701,7 +709,7 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   at(out, shore, { opacity: 0, duration: 0.42, ease: 'sine.in' });
   at(out, laydown, { opacity: 0, duration: 0.36, ease: 'sine.in' });
   // cranes slew their jibs out of the plane and lower away
-  raiseHook(L, 60, out - 0.1, 0.4);
+  raiseHook(L, 130, out - 0.1, 0.4);
   at(out + 0.04, L.st, { slew: 0.18, duration: 0.46, ease: 'power2.inOut' });
   at(out + 0.36, L.st, { rise: 0, duration: 0.56, ease: 'power2.in' });
   at(out + 0.12, R.st, { slew: 0.18, duration: 0.46, ease: 'power2.inOut' });
@@ -710,6 +718,8 @@ export function createIntroTimeline(svg: SVGSVGElement, frame: Frame): IntroTime
   const survey = q('survey');
   at(out + 0.44, survey, { opacity: 0, duration: 0.55, ease: 'sine.inOut' });
 
+  tl.addLabel('setting-out', BLACK_END);
+  tl.addLabel('hold', HOLD_START);
   // pin the end of the construction timeline
   set(HOLD_END, camera, { s: 1 });
 

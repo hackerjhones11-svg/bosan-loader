@@ -3,7 +3,7 @@ import type { Frame } from '../frame';
 import { CAP_HEIGHT, GLYPHS } from '../glyphData';
 import { GLYPH_ORDER, WORDMARKS, charOf, glyphPath, type GlyphKey } from '../layout';
 import { C } from '../palette';
-import { H_BAR, REGIONS, S_SPINE, polyPath, type RegionId } from '../parts';
+import { H_BAR, O_SPINE, REGIONS, S_SPINE, polyPath, type RegionId } from '../parts';
 import { SITES, TRUCK } from '../site';
 import { WordmarkGlyphs } from '../Wordmark';
 import { Crane, HookRig } from './Crane';
@@ -25,7 +25,7 @@ export const LIFT_JOINTS = [214, 428];
 
 /** Letters completed along their curve. */
 export const SPINE: Partial<Record<GlyphKey, { d: string; width: number }>> = {
-  O: { d: 'M383 -624A288 312 0 0 1 383 0A288 312 0 0 1 383 -624', width: 150 },
+  O: { d: O_SPINE, width: 150 },
   S1: { d: S_SPINE, width: 168 },
   S2: { d: S_SPINE, width: 168 },
 };
@@ -256,10 +256,15 @@ export const IntroScene = forwardRef<SVGSVGElement, Props>(function IntroScene({
 
         {/* ── temporary works: N shore and H scaffold ── */}
         <g data-k="shore" transform={tr('N')} opacity={0}>
-          <rect x={286} y={-12} width={60} height={12} fill={C.steel} />
-          <rect x={311} y={-338} width={10} height={326} fill={C.silver} />
-          <rect x={296} y={-352} width={40} height={14} fill={C.steel} />
-          <path d="M316 -150L260 -6M316 -150L372 -6" stroke={C.line} strokeWidth={1} vectorEffect="non-scaling-stroke" fill="none" />
+          {/* raking prop braced against the underside of the N's diagonal */}
+          <rect x={176} y={-9} width={44} height={9} fill={C.steel} />
+          <g transform="translate(198 -9) rotate(20.5)">
+            <rect x={-4.5} y={-318} width={9} height={318} fill={C.silver} />
+            <rect x={-6.5} y={-150} width={13} height={22} fill={C.steelLight} />
+          </g>
+          <g transform="translate(309 -307) rotate(40)">
+            <rect x={-20} y={-6} width={40} height={8} fill={C.steel} />
+          </g>
         </g>
         <g data-k="scaffold" transform={tr('H')}>
           <g data-k="scaffold-build" opacity={0}>
@@ -315,8 +320,11 @@ export const IntroScene = forwardRef<SVGSVGElement, Props>(function IntroScene({
 
         {/* ── hoist ropes, hooks, bridles, tag lines ── */}
         <g data-k="rigging">
-          <HookRig id="L" />
-          <HookRig id="R" />
+          {/* hooks sink below the ground with their cranes, so share the ground clip */}
+          <g clipPath={url('ground')}>
+            <HookRig id="L" />
+            <HookRig id="R" />
+          </g>
           <path data-k="tag-bowls" stroke={C.silverLight} strokeOpacity={0.85} strokeWidth={0.8} vectorEffect="non-scaling-stroke" fill="none" />
           <path data-k="tag-hBar" stroke={C.silverLight} strokeOpacity={0.85} strokeWidth={0.8} vectorEffect="non-scaling-stroke" fill="none" />
         </g>

@@ -12,7 +12,15 @@ import {
 } from 'react';
 import { computeFrame } from './frame';
 import { IntroScene } from './scene/IntroScene';
-import { BASE_DURATION, BLACK_END, HOLD_END, REVEAL_DURATION, createIntroTimeline, type IntroTimeline } from './timeline';
+import {
+  BASE_DURATION,
+  BLACK_END,
+  HOLD_END,
+  HOLD_START,
+  REVEAL_DURATION,
+  createIntroTimeline,
+  type IntroTimeline,
+} from './timeline';
 import { useScrollLock } from './useScrollLock';
 import { useViewport } from './useViewport';
 import { WordmarkSvg } from './Wordmark';
@@ -135,10 +143,15 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     introRef.current = intro;
     intro.tl.timeScale(timeScale);
     intro.tl.eventCallback('onComplete', () => setPhase((p) => (p === 'playing' ? 'holding' : p)));
+    // Skip intro is offered after the opening black and withdrawn once the
+    // name stands alone, so nothing shares the screen with it in the hold.
+    intro.tl.call(() => setSkipVisible(skippable), [], BLACK_END);
+    intro.tl.call(() => setSkipVisible(false), [], HOLD_START);
     // Rebuilt after a layout change mid-run: continue from the same moment.
     const resumeAt = timeRef.current;
     intro.tl.time(resumeAt, true);
     intro.render();
+    setSkipVisible(skippable && resumeAt >= BLACK_END && resumeAt < HOLD_START);
     if (resumeAt >= HOLD_END) {
       setPhase((p) => (p === 'playing' ? 'holding' : p));
     } else {
@@ -157,6 +170,8 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
           intro.render();
         },
         play: () => intro.tl.play(),
+        activeTweens: () => gsap.globalTimeline.getChildren(true, true, true).filter((t) => t.isActive()).length,
+        children: () => gsap.globalTimeline.getChildren(false, true, true).length,
       };
     }
     return () => {
@@ -166,7 +181,12 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     };
     // frame.mode is the only frame property that changes the scene geometry
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run, frame.mode, reduced]);
+  }, [run, frame.mode, reduced, skippable]);
+
+  // a new duration applies to the running timeline without restarting it
+  useEffect(() => {
+    introRef.current?.tl.timeScale(timeScale);
+  }, [timeScale]);
 
   // ── reduced motion: quiet wordmark only ───────────────────────────
   useLayoutEffect(() => {
@@ -181,14 +201,6 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     };
   }, [run, reduced]);
 
-  // ── Skip intro appears after the opening black ────────────────────
-  useEffect(() => {
-    setSkipVisible(false);
-    if (!skippable || reduced) return;
-    const t = window.setTimeout(() => setSkipVisible(true), (BLACK_END * 1000) / timeScale);
-    return () => window.clearTimeout(t);
-  }, [run, skippable, reduced, timeScale]);
-
   // ── bounded wait for assets once the name is complete ─────────────
   useEffect(() => {
     if (phase !== 'holding' || assetsReady) return;
@@ -196,17 +208,26 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     return () => window.clearTimeout(t);
   }, [phase, assetsReady, maxAssetWait]);
 
+  /** keyboard focus was inside the intro (e.g. on Skip intro) and must be handed on */
+  const focusInsideRef = useRef(false);
+
   const finish = useCallback(() => {
     if (completedRef.current) return;
     completedRef.current = true;
-    setPhase('done');
     const root = rootRef.current;
-    if (root && root.contains(document.activeElement)) {
-      const target = focusTargetRef?.current;
-      if (target) target.focus({ preventScroll: true });
-      else (document.activeElement as HTMLElement | null)?.blur?.();
-    }
+    const handFocus = focusInsideRef.current || (!!root && root.contains(document.activeElement));
+    setPhase('done');
     cb.current.onComplete?.({ skipped: skippedRef.current, timedOut: !cb.current.assetsReady });
+    if (handFocus) {
+      // Wait for the host to commit (and lift any inert state) before focusing.
+      const target = focusTargetRef?.current;
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          if (target && target.isConnected) target.focus({ preventScroll: true });
+          else if (root?.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+        }),
+      );
+    }
   }, [focusTargetRef]);
 
   // ── handoff: the black opens around the name ──────────────────────
@@ -226,13 +247,16 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
         backdrop.style.opacity = String(1 - state.o);
         return;
       }
-      // a soft-edged band opens from the wordmark's centre line outward
+      // a soft-edged band opens from the wordmark's centre line outward;
+      // it starts fully closed and thins before it widens
       const half = state.o * (h / 2 + feather);
+      const k = Math.min(1, state.o / 0.12);
+      const inner = `rgba(0,0,0,${(1 - k).toFixed(3)})`;
       const a = `calc(50% - ${half.toFixed(1)}px)`;
       const b = `calc(50% + ${half.toFixed(1)}px)`;
       const a2 = `calc(50% - ${(half + feather).toFixed(1)}px)`;
       const b2 = `calc(50% + ${(half + feather).toFixed(1)}px)`;
-      const mask = `linear-gradient(to bottom, #000 ${a2}, transparent ${a}, transparent ${b}, #000 ${b2})`;
+      const mask = `linear-gradient(to bottom, #000 ${a2}, ${inner} ${a}, ${inner} ${b}, #000 ${b2})`;
       backdrop.style.maskImage = mask;
       backdrop.style.webkitMaskImage = mask;
       backdrop.style.opacity = String(Math.min(1, (1 - state.o) / 0.35));
@@ -241,22 +265,41 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     tl.to(state, { o: 1, duration: total, ease: reduced ? 'sine.inOut' : 'power2.inOut', onUpdate: apply });
     revealTlRef.current = tl;
     apply();
+    if (debug) {
+      // review tooling: optionally hold the handoff so it can be stepped frame by frame
+      const dbg = (window as unknown as Record<string, Record<string, unknown>>).__bosanIntro;
+      if (dbg) {
+        dbg.reveal = tl;
+        if (dbg.pauseReveal) tl.pause();
+      }
+    }
     return () => {
       // only kill on unmount/replay; phase changes to 'revealing' re-run this effect harmlessly
     };
-  }, [phase, assetsReady, waitExpired, reduced, timeScale, finish]);
+  }, [phase, assetsReady, waitExpired, reduced, timeScale, finish, debug]);
 
   // ── hard failsafe: the intro can never stay on screen indefinitely ─
+  // Counts only time the page is visible, so a tab opened in the background
+  // still plays its intro when the viewer arrives.
   useEffect(() => {
+    if (debug) return;
     const limit = (reduced ? 6000 : (duration + 4) * 1000) + maxAssetWait;
-    const t = window.setTimeout(() => {
-      introRef.current?.tl.kill();
-      revealTlRef.current?.kill();
-      if (backdropRef.current) backdropRef.current.style.opacity = '0';
-      finish();
-    }, limit);
-    return () => window.clearTimeout(t);
-  }, [run, reduced, duration, maxAssetWait, finish]);
+    let visibleMs = 0;
+    let last = performance.now();
+    const id = window.setInterval(() => {
+      const now = performance.now();
+      if (document.visibilityState === 'visible') visibleMs += Math.min(now - last, 1000);
+      last = now;
+      if (visibleMs >= limit) {
+        window.clearInterval(id);
+        introRef.current?.tl.kill();
+        revealTlRef.current?.kill();
+        if (backdropRef.current) backdropRef.current.style.opacity = '0';
+        finish();
+      }
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [run, reduced, duration, maxAssetWait, finish, debug]);
 
   // kill the handoff tween on unmount or replay
   useEffect(
@@ -270,6 +313,7 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
   const skip = useCallback(() => {
     if (phase !== 'playing') return;
     skippedRef.current = true;
+    focusInsideRef.current = !!rootRef.current?.contains(document.activeElement);
     const intro = introRef.current;
     if (intro) {
       intro.tl.progress(1, true);
@@ -287,6 +331,7 @@ export const BosanIntro = forwardRef<BosanIntroHandle, BosanIntroProps>(function
     timeRef.current = 0;
     skippedRef.current = false;
     completedRef.current = false;
+    focusInsideRef.current = false;
     const backdrop = backdropRef.current;
     if (backdrop) {
       backdrop.style.opacity = '1';
