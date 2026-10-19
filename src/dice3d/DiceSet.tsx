@@ -14,6 +14,8 @@ import { DIE_HALF, type TrayDims } from './trayConfig';
 
 declare global {
   interface Window {
+    /** Dev-only: simulation time of the frame on screen during a roll. */
+    __playT?: number;
     __diceDebug?: {
       rollId: string;
       upward: (SymbolId | null)[];
@@ -34,6 +36,13 @@ const LEAD = 1 / 60;
  * instead of skipping, and a single long stall never triggers a burst of work.
  */
 const PHYSICS_BUDGET_MS = 6;
+/** Dev-only `?slowmo=N`: play rolls N times slower, for frame-by-frame inspection. */
+const SLOWMO = (() => {
+  if (!import.meta.env.DEV || typeof window === 'undefined') return 1;
+  const n = Number(new URLSearchParams(window.location.search).get('slowmo'));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+})();
+
 /** How quickly halos and edge glow ease toward their target (per second). */
 const EASE_RATE = 9;
 
@@ -49,6 +58,9 @@ interface LiveRoll {
   /** Last keep-alive sent to the store's watchdog. */
   lastAlive: number;
 }
+
+/** Sound session of the most recent 3D roll (see soundEngine.release). */
+let soundToken = -1;
 
 interface Reveal {
   start: number;
@@ -187,8 +199,12 @@ export function DiceSet({
       };
     };
 
-    /** Dice are confirmed at rest on the recorded faces: hand over to the reveal. */
-    const finishLive = (live: LiveRoll, now: number) => {
+    /**
+     * Dice are confirmed at rest on the recorded faces: hand over to the reveal.
+     * `silent` (tab hidden) skips the chime, which would otherwise sound in the
+     * background or whenever the user comes back.
+     */
+    const finishLive = (live: LiveRoll, now: number, silent = false) => {
       const final = live.sim ? live.sim.finalPoses() : live.reduced!.to;
       restRef.current = clonePoses(final);
       liveRef.current = null;
@@ -198,6 +214,7 @@ export function DiceSet({
       if (!live.settlingSent) rollStore.markSettling(live.roll.id);
       rollStore.completeRoll(live.roll.id);
       startReveal(live.roll.faces, now);
+      if (silent) revealRef.current!.chimed = true;
       if (import.meta.env.DEV) {
         // Dev-only verification hook: what the rendered meshes actually show.
         window.__diceDebug = {
@@ -260,13 +277,13 @@ export function DiceSet({
     const finishNow = () => {
       const live = liveRef.current;
       if (!live) return;
-      soundEngine.stopAll();
+      soundEngine.release(soundToken);
       if (live.sim) {
         live.sim.runToEnd();
         live.sim.repair(live.sim.wrongDice());
         live.sim.runToEnd();
       }
-      finishLive(live, performance.now());
+      finishLive(live, performance.now(), true);
     };
 
     const frame = () => {
@@ -279,9 +296,9 @@ export function DiceSet({
       if (live) {
         if (live.start === null) {
           live.start = now;
-          if (live.sim) soundEngine.beginRoll();
+          if (live.sim) soundToken = soundEngine.beginRoll();
         }
-        let t = (now - live.start) / 1000;
+        let t = (now - live.start) / 1000 / SLOWMO;
 
         if (live.sim) {
           const sim = live.sim;
@@ -293,10 +310,11 @@ export function DiceSet({
           if (!sim.done && sim.time < t) {
             // Physics fell behind (slow device, long frame): slow the playback
             // down rather than skipping ahead, so no motion or sound is lost.
-            live.start += (t - sim.time) * 1000;
+            live.start += (t - sim.time) * 1000 * SLOWMO;
             t = sim.time;
           }
           const shown = sim.done ? Math.min(t, sim.restAt!) : t;
+          if (import.meta.env.DEV) window.__playT = shown;
           for (let i = 0; i < 6; i++) sim.sample(i, shown, P[i], Q[i]);
           applyPoses(P, Q);
           sim.shake.offset(shown, offset);
@@ -408,7 +426,7 @@ export function DiceSet({
       unsubscribeRoll();
       unsubscribeUi();
       document.removeEventListener('visibilitychange', onVisibility);
-      soundEngine.stopAll();
+      soundEngine.release(soundToken);
     };
   }, [controller]);
 

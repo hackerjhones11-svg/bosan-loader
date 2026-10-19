@@ -14,7 +14,8 @@ import type { VisualRandom } from './visualRandom';
  *   leans toward the tray's long side, plus a weaker cross-stroke at an
  *   unrelated frequency, so the motion is elliptical and never periodic;
  * - slow amplitude swell, like a person's arms;
- * - a few irregular jolts with a small upward component that make dice hop;
+ * - a few irregular jolts: a sideways shove while the tray briefly dips and
+ *   catches, which lets dice go light and hop;
  * - a smooth envelope: build-up, sustain, then the hands stop.
  *
  * All parameters are drawn once per roll from the visual-only RNG, so no two
@@ -87,7 +88,7 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
       width: 0.06 + random() * 0.05,
       x: Math.cos(angle) * mag,
       z: Math.sin(angle) * mag,
-      y: g * (0.55 + random() * 0.6),
+      y: g * (0.7 + random() * 0.5),
     });
   }
 
@@ -121,10 +122,12 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
       for (const j of jolts) {
         const u = (t - j.t) / j.width;
         if (u < 0 || u > 1) continue;
-        const pulse = Math.sin(Math.PI * u) * envelope(t);
-        out.x += j.x * pulse;
-        out.z += j.z * pulse;
-        out.y += j.y * pulse;
+        const env = envelope(t);
+        out.x += j.x * Math.sin(Math.PI * u) * env;
+        out.z += j.z * Math.sin(Math.PI * u) * env;
+        // Dice feel −a: the tray dips (dice go light and hop), then catches
+        // them again, so the jolt leaves no net vertical velocity.
+        out.y -= j.y * Math.sin(2 * Math.PI * u) * env;
       }
       return out;
     },

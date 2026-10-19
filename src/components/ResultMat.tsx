@@ -58,7 +58,7 @@ function MatTile({ id, count, rollKey, index }: { id: SymbolId; count: number | 
 function ResultSummary({ counts }: { counts: Parameters<typeof rankedCounts>[0] }) {
   const { lang } = useStrings();
   // Appears just after the last tile has turned over.
-  const delay = ROLL_TIMING.revealHold + SYMBOL_IDS.length * ROLL_TIMING.countStagger + 0.08;
+  const delay = ROLL_TIMING.revealHold + SYMBOL_IDS.length * ROLL_TIMING.countStagger + 0.04;
   return (
     <p className="mat-summary" style={{ animationDelay: `${delay}s` }}>
       {rankedCounts(counts).map(({ id, count }, i) => (

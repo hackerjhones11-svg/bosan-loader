@@ -28,6 +28,7 @@ npm run dev          # http://localhost:5173  (admin tools: http://localhost:517
 | `npm test` | Unit tests (Vitest) |
 | `npm run check` | Typecheck + lint + tests |
 | `npm run diag:distribution` | Optional developer tool: tallies 200,000 fair rolls. Informational, **not** a test gate |
+| `npm run diag:simulation` | Optional developer tool: motion quality and controller statistics over many simulated rolls |
 
 Development switches (query string):
 
@@ -37,35 +38,85 @@ Development switches (query string):
 
 ## How a roll works
 
+A roll takes about 5–6 seconds from pressing Roll to the finished reveal. Every duration lives in one
+place, `src/game/rollTiming.ts` (`ROLL_TIMING`), shared by the 3D tray, the 2D fallback and the reveal:
+
+| Time (s) | What happens |
+|---|---|
+| 0 – 0.3 | the hands start shaking the tray (`buildUp`) |
+| 0.3 – 3.35 | energetic shaking; dice slide, tumble, hop, hit the rim and each other. From 1.5 s (`steerFrom`) a landing may be steered toward the recorded face, which the shake makes indistinguishable from a tray-made tumble |
+| 3.35 – 3.65 | the hands stop: the shake fades out (`shakeEnd`, `shakeFade`) |
+| 3.65 – ~5.1 | dice coast on their remaining momentum, make their last tumbles and settle (median rest ≈ 5.1 s) |
+| rest + 0.16 | brief hold on the final arrangement (`revealHold`) |
+| … + 0.62 | halos, staggered counts and summary; Roll is ready again (`revealDuration`), ≈ 5.9 s in total |
+
 1. **Outcome first.** `rollStore.requestRoll()` draws six independent faces with `crypto.getRandomValues`
    and creates one frozen `RollRecord` (`id`, `timestamp`, `faces`, derived `counts`, `mode`).
    Everything else (dice, mat, history, the screen-reader announcement) is derived from that object.
 2. **Unbiased draws.** `src/game/random.ts` uses rejection sampling: uint32 words at or above
    `2^32 − (2^32 mod 6)` are discarded, so each symbol has exactly a 1-in-6 chance on every die.
-   An ESLint rule bans `Math.random` everywhere except `src/dice3d/visualRandom.ts`, which drives launch
-   spin and the 2D flicker only.
-3. **Physics without a say.** `src/dice3d/rollPlanner.ts` simulates the throw with cannon-es in a few
-   milliseconds *before* anything moves, retrying with different (visual-only) launch parameters until all six
-   dice rest flat, unstacked and inside the tray. For each die it then picks one of the 24 rotations that map a
-   cube onto itself, `R`, so that `settledPose · R` has the recorded symbol on top, and renders the whole track
-   as `bodyPose · R`. Because `R` maps the cube onto itself, the rendered die fills exactly the simulated
-   volume all the way through (same contacts, same shadows) and nothing snaps. The last 0.22 s blends away
-   sub-degree tilt into the exact final pose. If physics fails, a procedural tumble ending on the same faces
-   is used.
-4. **Playback** (`rollAnimation.ts`) is time-based and starts on the first rendered frame. A short "gather"
-   lifts the dice into the throw, then the recorded track plays, with impact sounds scheduled from the
-   simulated collisions. Sampling at or past the end always gives the exact final poses, so a dropped frame,
-   a hidden tab or a watchdog finish can never show a different face.
+   An ESLint rule bans `Math.random` everywhere except `src/dice3d/visualRandom.ts`, which only varies
+   the shake, the starting spins and sound textures.
+3. **A shaken tray** (`src/dice3d/diceSimulation.ts`, `shake.ts`, `dieCollider.ts`). A live cannon-es world
+   runs at a fixed 180 Hz step in *tray space*: the felt, the four walls and an invisible lid are static, and
+   the hands appear as one shared pseudo-force −m·a(t) on every die. a(t) is a ~2 Hz stroke along a drifting
+   axis plus a weaker cross-stroke, a slow swell and a few jolts with an upward kick, all re-drawn every
+   roll. Dice are dynamic bodies with chamfered convex hulls that wrap the rounded visual dice exactly. They
+   start from wherever they rest, so the roll begins with the real dice the player can see.
+4. **Landing on the recorded faces.** Because the dice start visible, the physics itself must finish on the
+   recorded faces; nothing is relabelled or swapped. After the shake, a controller acts only at settled
+   landings:
+   - a die landing with its recorded face up is *caught* (felt absorbs most of its spin);
+   - otherwise a breadth-first search over its possible tumbles (a die can only tip over the edge under one
+     of its four sides, moving one die-width) finds the shortest sequence that ends with the face up without
+     hitting a wall or a settling die, preferring directions that don't reverse a moving die. The die is
+     then given exactly the spin a cube needs to roll over one edge;
+   - a die that rests cocked against a wall or on another die gets a small shove;
+   - bounded recovery: a die still on a wrong face at `recoverFrom` rolls over its edge(s) along a scripted
+     path (kinematic, so it still pushes neighbours, with its lowest corner on the felt). By `hardStop` every
+     die is resolved, and an absolute bound ends the roll whatever happens.
+   The rendered die is the physics body every frame, so its face never changes after it stops. The resting
+   faces are checked against the record once more before the reveal.
+5. **Playback** (`DiceSet.tsx`) advances the simulation slightly ahead of the frame being drawn within a
+   CPU budget, so it stays in time on slow devices (if it cannot, playback slows instead of skipping). The
+   tray and dice tremble by a scaled-down copy of the same shake. A hidden tab completes the roll at once
+   instead of replaying queued steps later.
+
+The developer diagnostic `npm run diag:simulation` reports, over many rolls, rest times, path length per
+die, tray coverage, wall and die-to-die contacts, tumbles, penetration and how often each controller
+intervention was needed.
+
+### Sound (`src/audio/soundEngine.ts`)
+
+Synthesised with Web Audio (no files): every collision the simulation reports becomes a short percussive
+voice (bright clack for die-on-die, woody knock for the rim, muffled tap on felt) whose level follows the
+impact speed, with slight pitch variation. Under them, a felt "slide" bed and tiny rattle grains follow how
+vigorously the dice move, so the sound builds with the shake, thins as the dice coast and is silent at rest.
+Repeats per die are throttled, overlapping voices are capped, everything runs through a per-roll bus and a
+compressor (no stacking across rolls, no clipping), and audio starts only from the Roll gesture and is never
+required for a roll to complete.
+
+### Reveal
+
+When all six dice are confirmed at rest, the store records the roll (`completeRoll` → `revealing`). The
+arrangement is held for a moment; then a soft warm halo appears under dice whose symbol came up more than
+once, with a single gentle glow along their ivory edges (never over the symbols). The mat's counts turn over
+tile by tile, a summary such as "Paan ×3 · Jhandi ×2 · Burja ×1" appears, and the Roll button becomes
+available again (`result`). Hovering or tapping a mat tile lights the matching dice.
 
 ### State machine
 
 ```
-idle ──requestRoll──▶ rolling ──markSettling──▶ settling ──completeRoll──▶ result ──requestRoll──▶ …
+idle ──requestRoll──▶ rolling ──markSettling──▶ settling ──completeRoll──▶ revealing ──(timer)──▶ result
 ```
 
-Only one roll can be active; every trigger (button, Space/Enter, admin) goes through the same guard.
-`completeRoll` is idempotent per roll id, so history never gets duplicates. A 9 s watchdog completes a
-stuck roll with its already-selected result. A hidden tab finishes the roll immediately on the recorded result.
+Only one roll can be active, including its reveal; every trigger (button, Space/Enter, admin) goes through
+the same guard. `completeRoll` is idempotent per roll id, so history gets exactly one entry. A watchdog
+completes a stuck roll with its already-selected result; a renderer that is still making progress on a slow
+device keeps it at bay with `keepAlive`.
+
+Reduced motion replaces the shaken tumble with a short dip: the dice shrink away where they are and
+return showing the recorded faces, followed by the same reveal.
 
 ### Face map (`src/dice3d/faceMap.ts`)
 
@@ -83,12 +134,11 @@ camera on the +Z side, so "screen-up" for a face lying on the felt is −Z.
 
 - Texture orientation: each face decal is a plane whose +Z is the normal and +Y the artwork-up
   (`decalQuaternion`), with UVs into a 3 × 2 atlas cell (`atlasUvRect`).
-- Final quaternion: `restQuaternion(symbol, yaw)` puts the symbol face-up with its artwork upright to the
-  viewer, turned by `yaw`. For physics rolls the final pose is `snapUpright(settled) · R`, where
-  `symmetryForTarget` picks the `R` whose artwork reads most upright (always within 45°).
-- `upwardFace(q)` reads back which symbol is up. Tests check it for every symbol, yaw and settled pose.
+- `upwardFace(q)` reads which symbol is up for any orientation; the controller drives the recorded face's
+  normal to +Y, and `restQuaternion(symbol, yaw)` gives the face-up orientation used by reduced motion.
 
-Real dice vary by maker; this layout is used consistently by the decals, planner, tests and fallback.
+Real dice vary by maker; this layout is used consistently by the decals, the physics controller, the tests
+and the fallback.
 
 ## Admin testing (`/admin`)
 
@@ -113,7 +163,7 @@ Integrity does not rely on secrecy:
 ```
 src/
   game/        symbols, SVG artwork (single source), secure RNG, RollRecord, store, history, storage
-  dice3d/      face map, tray config, physics planner, playback, textures, tray, dice, camera fit, 3D stage
+  dice3d/      face map, collider, shake, live simulation + outcome controller, tray, dice, camera fit, 3D stage
   fallback2d/  2D dice cards (same store and engine)
   components/  header, roll control, result mat, history, help dialog, live region, stage, test banner
   admin/       admin panel, distribution diagnostic
@@ -137,7 +187,7 @@ the app keeps working in memory.
 - Semantic buttons, a native `<dialog>` for help, visible focus, named icon buttons, and symbol names
   alongside colour. One polite live-region announcement per completed roll.
 - Space/Enter roll only when focus is on the page itself, never inside controls or dialogs.
-- Reduced motion swaps the tumble for a quick shrink-and-reveal at the same final poses.
+- Reduced motion swaps the shaken tumble for a quick shrink-and-return in place, then the same reveal.
 - Sound is optional, starts only after a user gesture, and the mute preference persists.
 - Rendering is on demand (idle frames are free). Device pixel ratio is capped (2, or 1.75 on touch devices).
   Geometry, materials and the symbol atlas are shared by all dice and disposed on unmount. One 1024² shadow
@@ -149,3 +199,8 @@ the app keeps working in memory.
 - React Three Fiber 9 still constructs `THREE.Clock`, so three.js r18x logs a deprecation warning in the console.
 - The 3D chunk is ~275 kB gzip; R3F references the whole three.js namespace, so it cannot be tree-shaken further.
 - Sounds are synthesised, so they are deliberately restrained rather than recorded dice.
+- Free physics does not always deliver the recorded face in time. In 100 simulated rolls per tray shape,
+  15–28% of rolls needed no help beyond steered tumbles; on average 1.3 (wide/square tray) to 1.75
+  (tall, phone-portrait tray) dice per roll take the bounded recovery roll. It starts at a landing or while
+  the die is still moving where possible, follows real tipping dynamics and pushes neighbours, so it reads
+  as a last tumble, but it is scripted rather than free physics and a careful viewer may notice it.

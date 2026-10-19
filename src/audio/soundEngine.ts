@@ -92,6 +92,8 @@ class SoundEngine {
   private lastByKey = new Map<string, number>();
   private grainDebt = 0;
   private lastActivityAt = 0;
+  /** Identifies the roll that currently owns the bus (see beginRoll/release). */
+  private session = 0;
   /** Counters for verification and tuning (cheap; never affect playback). */
   readonly stats = { impacts: 0, grains: 0, dropped: 0, lastVoiceAt: 0, lastImpactAt: 0, rolls: 0, bedPeak: 0 };
   enabled = true;
@@ -212,15 +214,22 @@ class SoundEngine {
     }
   }
 
-  /** Starts a fresh bus for a new roll, fading out anything left from the last one. */
-  beginRoll(): void {
+  /**
+   * Starts a fresh bus for a new roll, fading out anything left from the last
+   * one. Returns a token for release(), so a renderer that is torn down later
+   * (e.g. the 3D view replaced by the 2D fallback mid-roll) can only silence
+   * its own roll, never the one that replaced it.
+   */
+  beginRoll(): number {
     this.stopAll();
+    this.session += 1;
+    const token = this.session;
     this.lastByKey.clear();
     this.grainDebt = 0;
     this.lastActivityAt = 0;
     try {
       const r = this.live();
-      if (!r) return;
+      if (!r) return token;
       this.stats.rolls += 1;
       const { ctx, bus, noise } = r;
       const source = ctx.createBufferSource();
@@ -238,6 +247,12 @@ class SoundEngine {
     } catch {
       this.bed = null;
     }
+    return token;
+  }
+
+  /** Silences the given roll's sound if it still owns the bus. */
+  release(token: number): void {
+    if (token === this.session) this.stopAll();
   }
 
   /**

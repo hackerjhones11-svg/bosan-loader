@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm run test",
-    "diag:distribution": "vitest run --config vitest.diag.config.ts"
+    "diag:distribution": "vitest run --config vitest.diag.config.ts scripts/distribution.diag.ts",
+    "diag:simulation": "vitest run --config vitest.diag.config.ts scripts/simulation.diag.ts"
   },
   "dependencies": {
     "@react-three/fiber": "^9.8.2",

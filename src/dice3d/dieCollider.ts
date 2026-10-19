@@ -4,8 +4,9 @@ import { DIE_HALF } from './trayConfig';
 /**
  * Collision hull for one die: a cube with every edge and corner chamfered,
  * sized to wrap the rendered rounded cube (corner radius r) as tightly as a
- * flat-faced hull can. A chamfer of r·(1 − 1/√2) makes each edge bevel
- * tangent to the visual rounding, so dice touch exactly where they appear to
+ * flat-faced hull can. Cutting r·(2 − √2) from each edge makes every 45°
+ * bevel tangent to the visual rounding (the bevel plane x + y = 2h − c is at
+ * distance r from the rounding's axis), so dice touch where they appear to
  * touch, and the bevels let them tip and roll like real rounded dice.
  *
  * Faces are generated from their outward normals: 6 axis faces, 12 edge
@@ -16,7 +17,7 @@ import { DIE_HALF } from './trayConfig';
 export const VISUAL_CORNER_RADIUS = 0.11;
 
 export function chamferForRadius(radius: number): number {
-  return radius * (1 - Math.SQRT1_2);
+  return radius * (2 - Math.SQRT2);
 }
 
 export function createDieShape(half = DIE_HALF, chamfer = chamferForRadius(VISUAL_CORNER_RADIUS)): ConvexPolyhedron {
@@ -75,5 +76,7 @@ export function createDieShape(half = DIE_HALF, chamfer = chamferForRadius(VISUA
       .map((e) => e.i);
   });
 
-  return new ConvexPolyhedron({ vertices, faces });
+  // Separating-axis tests only need one normal per direction: 3 + 6 + 4 = 13.
+  const axes = normals.filter((n) => n.x > 1e-9 || (Math.abs(n.x) < 1e-9 && (n.y > 1e-9 || (Math.abs(n.y) < 1e-9 && n.z > 0))));
+  return new ConvexPolyhedron({ vertices, faces, axes });
 }

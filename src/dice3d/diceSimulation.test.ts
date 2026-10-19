@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Faces } from '../game/roll';
 import { ROLL_TIMING } from '../game/rollTiming';
 import { SYMBOL_IDS } from '../game/symbols';
-import { createDieShape, VISUAL_CORNER_RADIUS } from './dieCollider';
+import { chamferForRadius, createDieShape, VISUAL_CORNER_RADIUS } from './dieCollider';
 import { DiceSimulation, PHYSICS } from './diceSimulation';
 import { upwardFace } from './faceMap';
 import { gridLayout } from './layout';
@@ -27,16 +27,39 @@ function footprintAxes(q: Quaternion): Vector3[] {
     .map((a) => a.setY(0).normalize());
 }
 
-/** Separating-axis test for two upright unit dice on the felt; penetration depth (≤ 0 = apart). */
+/** Footprint of an upright die on the felt: its chamfered hull is an octagon in plan view. */
+function footprint(p: Vector3, q: Quaternion): { x: number; z: number }[] {
+  const [a, b] = footprintAxes(q);
+  const c = chamferForRadius(VISUAL_CORNER_RADIUS);
+  const local = [
+    [DIE_HALF, DIE_HALF - c],
+    [DIE_HALF - c, DIE_HALF],
+    [-(DIE_HALF - c), DIE_HALF],
+    [-DIE_HALF, DIE_HALF - c],
+    [-DIE_HALF, -(DIE_HALF - c)],
+    [-(DIE_HALF - c), -DIE_HALF],
+    [DIE_HALF - c, -DIE_HALF],
+    [DIE_HALF, -(DIE_HALF - c)],
+  ];
+  return local.map(([u, v]) => ({ x: p.x + a.x * u + b.x * v, z: p.z + a.z * u + b.z * v }));
+}
+
+/** Separating-axis test for two resting dice (octagonal footprints); penetration depth (≤ 0 = apart). */
 function footprintOverlap(p1: Vector3, q1: Quaternion, p2: Vector3, q2: Quaternion): number {
-  const a1 = footprintAxes(q1);
-  const a2 = footprintAxes(q2);
-  const d = p2.clone().sub(p1).setY(0);
+  const f1 = footprint(p1, q1);
+  const f2 = footprint(p2, q2);
   let depth = Infinity;
-  for (const axis of [...a1, ...a2]) {
-    const r1 = a1.reduce((s, e) => s + DIE_HALF * Math.abs(axis.dot(e)), 0);
-    const r2 = a2.reduce((s, e) => s + DIE_HALF * Math.abs(axis.dot(e)), 0);
-    depth = Math.min(depth, r1 + r2 - Math.abs(d.dot(axis)));
+  for (const poly of [f1, f2]) {
+    for (let k = 0; k < poly.length; k++) {
+      const e = poly[(k + 1) % poly.length];
+      const nx = e.z - poly[k].z;
+      const nz = -(e.x - poly[k].x);
+      const len = Math.hypot(nx, nz);
+      const project = (pts: { x: number; z: number }[]) => pts.map((pt) => (pt.x * nx + pt.z * nz) / len);
+      const a = project(f1);
+      const b = project(f2);
+      depth = Math.min(depth, Math.min(Math.max(...a), Math.max(...b)) - Math.max(Math.min(...a), Math.min(...b)));
+    }
   }
   return depth;
 }
@@ -74,6 +97,26 @@ describe('dice simulation: outcomes', () => {
     expect(sim.restAt!).toBeGreaterThan(ROLL_TIMING.shakeEnd);
     expect(sim.restAt!).toBeLessThan(ROLL_TIMING.hardStop + 1.3);
   });
+});
+
+describe('dice simulation: many rolls', () => {
+  it('always lands on the recorded faces within the bounded timeline, never ending a roll outright', () => {
+    const random = seededVisualRandom(4242);
+    for (const preset of Object.keys(TRAY_PRESETS) as (keyof typeof TRAY_PRESETS)[]) {
+      const dims = TRAY_PRESETS[preset];
+      let start = gridLayout(SYMBOL_IDS, dims);
+      for (let r = 0; r < 8; r++) {
+        const faces = Array.from({ length: 6 }, () => SYMBOL_IDS[Math.floor(random() * 6)]) as unknown as Faces;
+        const sim = new DiceSimulation(faces, dims, start, { random });
+        sim.runToEnd();
+        expect(sim.stats.forced).toBe(0);
+        expect(sim.wrongDice()).toEqual([]);
+        expect(sim.restAt!).toBeLessThan(ROLL_TIMING.hardStop + 0.9);
+        start = sim.finalPoses();
+        start.forEach((pose, i) => expect(upwardFace(pose.quaternion).symbol).toBe(faces[i]));
+      }
+    }
+  }, 60000);
 });
 
 describe('dice simulation: continuity and containment', () => {

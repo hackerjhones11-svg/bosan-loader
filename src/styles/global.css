@@ -484,16 +484,16 @@ button {
 }
 
 .mat.has-result .tile-count {
-  animation: count-in 0.42s cubic-bezier(0.2, 0.8, 0.3, 1.2) var(--reveal-delay, 0s) both;
+  animation: count-in 0.34s cubic-bezier(0.2, 0.8, 0.3, 1.2) var(--reveal-delay, 0s) both;
 }
 
 .mat.has-result .tile.is-zero .tile-count {
-  animation: count-fade 0.35s ease-out var(--reveal-delay, 0s) both;
+  animation: count-fade 0.3s ease-out var(--reveal-delay, 0s) both;
 }
 
 /* A single, restrained pulse for symbols that came up more than once. */
 .mat.has-result .tile.is-multi {
-  animation: multi-pulse 0.9s ease-out calc(var(--reveal-delay, 0s) + 0.12s) 1 both;
+  animation: multi-pulse 0.55s ease-out var(--reveal-delay, 0s) 1 both;
 }
 
 .mat-summary {
@@ -501,7 +501,7 @@ button {
   font-size: 13.5px;
   color: var(--text);
   text-align: right;
-  animation: count-fade 0.4s ease-out 0.62s both;
+  animation: count-fade 0.3s ease-out 0.5s both;
 }
 
 .summary-item {

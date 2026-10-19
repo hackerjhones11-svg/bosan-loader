@@ -86,8 +86,15 @@ const CONTROL = {
   dieRoom: 1.12,
   /** Dice slower than this also block their current spot (faster ones only their projected one). */
   obstacleSpeed: 1.5,
+  /** During the shake, steer only dice slower than this, at most once per gap (s). */
+  shakeSteerSpeed: 4,
+  shakeSteerGap: 0.45,
+  /** After the shake, a die still on a wrong face with no plan for this long is rolled home. */
+  stallHold: 0.12,
+  /** A moving die with no plan this close to recoverFrom is rolled home straight away. */
+  lateRollLead: 0.4,
   /** Typical time from starting a tumble to landing (plans must finish before recovery). */
-  tumbleTime: 0.28,
+  tumbleTime: 0.26,
   /** A steered tumble is judged again once it has landed, or after this long. */
   tumbleTimeout: 0.8,
   /** Cocked or stacked: nearly still while not lying flat on the felt, for this long. */
@@ -101,8 +108,6 @@ const CONTROL = {
   restSteps: 6,
   /** All six resting this long ends the roll. */
   restHold: 0.08,
-  /** Duration of the scripted recovery roll, per quarter turn. */
-  recoveryQuarter: 0.2,
 } as const;
 
 export type ImpactSurface = 'die' | 'wall' | 'felt';
@@ -125,6 +130,8 @@ export interface SimulationStats {
   caught: number;
   nudges: number;
   scriptedRecoveries: number;
+  /** Times the absolute bound had to end a roll outright (expected 0). */
+  forced: number;
 }
 
 type DieStatus = 'free' | 'tumbling' | 'caught' | 'scripted';
@@ -136,6 +143,9 @@ interface Scripted {
   fromQ: Quaternion;
   toP: Vector3;
   toQ: Quaternion;
+  /** Total rotation (rad) and its axis, for the rolling profile and the final rock. */
+  angle: number;
+  axis: Vector3;
   startMargin: number;
 }
 
@@ -146,6 +156,10 @@ interface DieControl {
   /** Time the current steered tumble began; it has "left" once the die tilts away. */
   tumbleAt: number;
   leftFlat: boolean;
+  /** Spin already softened for the current mid-shake landing. */
+  softened: boolean;
+  /** Since when the die has lain still on a wrong face after the shake. */
+  stalledSince: number | null;
   /** Where the recorded face should be after the current tumble (1 up, 0 side, −1 down); diagnostics. */
   expectUp: number;
   nudgeAt: number;
@@ -167,6 +181,39 @@ export interface SimulationOptions {
 const UP = new Vector3(0, 1, 0);
 /** Seconds past hardStop after which a roll is finished outright, whatever its state. */
 const ABSOLUTE_GRACE = 1.2;
+
+/**
+ * Timing of one quarter roll over an edge, from energy conservation for a
+ * unit cube pivoting on its edge: θ̇² = ω₀² − 3g·(h_c(θ) − h), with the centre
+ * at height h_c(θ) = (√2/2)·sin(θ + π/4). The die leaves fast, slows over the
+ * balance point and speeds up into the landing, like a real tip. Tabulated
+ * once as cumulative time against angle.
+ */
+const QUARTER_PROFILE = (() => {
+  const g = PHYSICS.gravity;
+  const minSpin = Math.sqrt((2 * g * DIE_HALF * (Math.SQRT2 - 1)) / (2 / 3));
+  const w0 = minSpin * 1.15;
+  const n = 64;
+  const theta: number[] = [0];
+  const time: number[] = [0];
+  for (let k = 1; k <= n; k++) {
+    const a = ((k - 0.5) / n) * (Math.PI / 2);
+    const rate = Math.sqrt(Math.max(1e-3, w0 * w0 - 3 * g * (Math.SQRT1_2 * Math.sin(a + Math.PI / 4) - DIE_HALF)));
+    theta.push((k / n) * (Math.PI / 2));
+    time.push(time[k - 1] + Math.PI / 2 / n / rate);
+  }
+  return { theta, time, duration: time[n] };
+})();
+
+/** Angle reached `elapsed` seconds into a quarter roll. */
+function quarterAngle(elapsed: number): number {
+  const { theta, time, duration } = QUARTER_PROFILE;
+  if (elapsed >= duration) return Math.PI / 2;
+  let k = 1;
+  while (time[k] < elapsed) k++;
+  const f = (elapsed - time[k - 1]) / (time[k] - time[k - 1]);
+  return theta[k - 1] + f * (theta[k] - theta[k - 1]);
+}
 
 /** Hull vertices of a die, for exact ground contact during scripted moves. */
 const HULL = createDieShape().vertices.map((v) => new Vector3(v.x, v.y, v.z));
@@ -190,7 +237,7 @@ export class DiceSimulation {
   readonly shake: Shake;
   readonly timing: typeof ROLL_TIMING;
   readonly step = PHYSICS.step;
-  readonly stats: SimulationStats = { steeredTumbles: 0, caught: 0, nudges: 0, scriptedRecoveries: 0 };
+  readonly stats: SimulationStats = { steeredTumbles: 0, caught: 0, nudges: 0, scriptedRecoveries: 0, forced: 0 };
   /** Every collision worth hearing, in time order. */
   readonly impacts: ImpactEvent[] = [];
 
@@ -281,7 +328,7 @@ export class DiceSimulation {
         if (j !== -1 && j < i) return;
         if (strength < 0.5) return;
         const surface: ImpactSurface = j !== -1 ? 'die' : other === felt ? 'felt' : walls.has(other) ? 'wall' : 'wall';
-        this.impacts.push({ t: this.time, die: i, strength, surface });
+        this.recordImpact(i, strength, surface);
       });
       world.addBody(body);
       return body;
@@ -293,6 +340,8 @@ export class DiceSimulation {
       nudges: 0,
       tumbleAt: -1,
       leftFlat: false,
+      softened: false,
+      stalledSince: null,
       expectUp: 0,
       nudgeAt: -1,
       lastImpact: -1,
@@ -353,6 +402,22 @@ export class DiceSimulation {
     this.agitation[k] = Math.min(1, agitation / 60);
     this.sliding[k] = Math.min(1, sliding / 40);
     this.samples += 1;
+  }
+
+  /**
+   * cannon-es reports a new contact once per contact point, so one landing can
+   * arrive as several events in the same step: merge them (keep the hardest).
+   */
+  private recordImpact(die: number, strength: number, surface: ImpactSurface): void {
+    for (let k = this.impacts.length - 1; k >= 0; k--) {
+      const e = this.impacts[k];
+      if (this.time - e.t > 0.03) break;
+      if (e.die === die && e.surface === surface) {
+        if (strength > e.strength) this.impacts[k] = { ...e, strength };
+        return;
+      }
+    }
+    this.impacts.push({ t: this.time, die, strength, surface });
   }
 
   /** Advances by one fixed step. */
@@ -493,6 +558,19 @@ export class DiceSimulation {
     const resting = correct && targetUp > CONTROL.restAlign && flatOnFelt && speed < CONTROL.restSpeed && spin < CONTROL.restSpin;
     c.restSteps = resting ? c.restSteps + 1 : 0;
 
+    // Cocked against a wall or die, or lying on another die.
+    const nearlyStill = speed < 0.2 && spin < 0.4;
+    if (nearlyStill && !flatOnFelt) c.cockedSince ??= t;
+    else c.cockedSince = null;
+    if (c.cockedSince !== null && t - c.cockedSince >= CONTROL.cockedHold) {
+      c.cockedSince = null;
+      if (c.nudges >= CONTROL.maxNudges || t >= timing.recoverFrom) {
+        if (this.grounded(i)) this.beginScripted(i, 'cocked');
+      }
+      else if (t - c.nudgeAt > CONTROL.nudgeCooldown) this.nudge(i, body.position.y > CONTROL.onFeltHeight + 0.1 ? 'stacked' : 'cocked');
+      return;
+    }
+
     if (c.status === 'caught') {
       if (targetUp < 0.9) {
         // Knocked over by another die: back into play.
@@ -522,32 +600,39 @@ export class DiceSimulation {
       body.linearDamping = Math.min(0.4, PHYSICS.linearDamping + (t - timing.settleAssistFrom) * 0.5);
     }
 
-    // Cocked against a wall or die, or lying on another die.
-    const nearlyStill = speed < 0.2 && spin < 0.4;
-    if (nearlyStill && !flatOnFelt) c.cockedSince ??= t;
-    else c.cockedSince = null;
-    if (c.cockedSince !== null && t - c.cockedSince >= CONTROL.cockedHold) {
-      c.cockedSince = null;
-      if (c.nudges >= CONTROL.maxNudges || t >= timing.recoverFrom) this.beginScripted(i, 'cocked');
-      else if (t - c.nudgeAt > CONTROL.nudgeCooldown) this.nudge(i, body.position.y > CONTROL.onFeltHeight + 0.1 ? 'stacked' : 'cocked');
-      return;
-    }
-
     // Late and still on a wrong face: bounded recovery. (A die already showing
     // its face but still rocking is left to settle; cocked dice are handled above.)
     if (t >= timing.recoverFrom && targetUp < 0.9) {
-      this.beginScripted(i, flatOnFelt ? 'late-flat-wrong' : 'late-moving');
+      // Wait for a die in flight to come down first; recovery never stops it in mid-air.
+      if (this.grounded(i)) this.beginScripted(i, flatOnFelt ? 'late-flat-wrong' : 'late-moving');
       return;
     }
 
+    // A die lying still on a wrong face after the shake is dealt with at once
+    // (below), so it never sits there visibly and then sets off by itself.
+    const shaking = t < timing.shakeEnd + timing.shakeFade;
+    if (!shaking && flatOnFelt && !correct && speed < 0.3 && spin < 0.6) c.stalledSince ??= t;
+    else c.stalledSince = null;
+
     // Decide only at a settled landing.
+    if (!flatOnFelt) c.softened = false;
     if (!flatOnFelt || speed > CONTROL.decideSpeed || spin > CONTROL.decideSpin || Math.abs(body.velocity.y) > CONTROL.decideBounce) {
       return;
     }
+    // While the hands are still shaking, the tray explains any tumble, so a
+    // landing may be steered too; but nothing is caught (that would look
+    // sticky) and a die is not steered on every bounce.
     if (correct) {
-      this.catchDie(i);
+      if (!shaking) this.catchDie(i);
+      else if (!c.softened) {
+        // Landed the right way up mid-shake: the felt takes some of its spin.
+        c.softened = true;
+        body.angularVelocity.x *= 0.5;
+        body.angularVelocity.z *= 0.5;
+      }
       return;
     }
+    if (shaking && (speed > CONTROL.shakeSteerSpeed || t - c.tumbleAt < CONTROL.shakeSteerGap)) return;
     this.steerTumble(i);
   }
 
@@ -712,10 +797,24 @@ export class DiceSimulation {
     const plan = this.planTumbles(i, this.onControl ? why : undefined);
     if (!plan) {
       const slow = Math.hypot(body.velocity.x, body.velocity.z) < 0.5;
+      // Stopped on a wrong face with nowhere to tumble: roll it home now,
+      // rather than leaving it to sit and then move later.
+      if (c.stalledSince !== null && this.time - c.stalledSince >= CONTROL.stallHold) {
+        this.beginScripted(i, 'stalled');
+        return;
+      }
+      // Too late for the tumbles it needs and still moving: roll it home now,
+      // as part of its motion, rather than later from a standstill.
+      const moving = body.velocity.length() > 0.4 || body.angularVelocity.length() > 0.8;
+      if (moving && this.time >= this.timing.recoverFrom - CONTROL.lateRollLead && this.targetNormal(i).y < 0.9) {
+        this.beginScripted(i, 'no-plan-moving');
+        return;
+      }
       this.onControl?.({ t: this.time, die: i, kind: 'hemmed', detail: [...new Set(why)].sort().join('+') });
-      // Completely boxed in with time to spare: a small shove to make room (never too often).
-      const early = this.time < this.timing.recoverFrom - 3 * CONTROL.tumbleTime;
-      if (slow && early && this.time - c.nudgeAt > CONTROL.nudgeCooldown && c.nudges < CONTROL.maxNudges) this.nudge(i);
+      // Boxed in while the tray is still shaking: a small shove to make room
+      // (the shake explains it). After the shake, the stall rule above applies.
+      const shaking = this.time < this.timing.shakeEnd + this.timing.shakeFade;
+      if (slow && shaking && this.time - c.nudgeAt > CONTROL.nudgeCooldown && c.nudges < CONTROL.maxNudges) this.nudge(i);
       return;
     }
     // Pass over one edge: the centre rises by h(√2 − 1) and a unit cube's
@@ -788,13 +887,20 @@ export class DiceSimulation {
     away.normalize().multiplyScalar(angle / (Math.PI / 2));
     const toP = this.freeSpot(i, new Vector3(fromP.x + away.x, DIE_HALF, fromP.z + away.z), SWEEP_MARGIN);
     const { halfWidth, halfDepth } = this.dims;
+    const quarters = angle / (Math.PI / 2);
+    const rollAxis = new Vector3().crossVectors(n, UP);
     c.scripted = {
       start: this.time,
-      duration: Math.max(0.26, (angle / (Math.PI / 2)) * CONTROL.recoveryQuarter + fromP.distanceTo(toP) * 0.06),
+      duration:
+        angle > 0.05
+          ? quarters * QUARTER_PROFILE.duration + Math.max(0, fromP.distanceTo(toP) - quarters) * 0.12
+          : 0.25 + fromP.distanceTo(toP) * 0.1,
       fromP,
       fromQ,
       toQ,
       toP,
+      angle,
+      axis: rollAxis.lengthSq() > 1e-6 ? rollAxis.normalize() : new Vector3(1, 0, 0),
       startMargin: Math.min(halfWidth - Math.abs(fromP.x), halfDepth - Math.abs(fromP.z)),
     };
     c.status = 'scripted';
@@ -805,19 +911,32 @@ export class DiceSimulation {
     this.stats.scriptedRecoveries += 1;
   }
 
-  /** Nearest spot to `want` on the felt that no other die occupies. */
+  /**
+   * Nearest spot to `want` on the felt that no other die occupies, nor will
+   * occupy once its own recovery move ends (two kinematic dice do not collide
+   * with each other, so their destinations must not coincide).
+   */
   private freeSpot(i: number, want: Vector3, wallMargin: number): Vector3 {
     const p = want.clone();
     const limX = this.dims.halfWidth - wallMargin;
     const limZ = this.dims.halfDepth - wallMargin;
-    for (let iteration = 0; iteration < 40; iteration++) {
+    const clamp = () => {
       p.x = Math.max(-limX, Math.min(limX, p.x));
       p.z = Math.max(-limZ, Math.min(limZ, p.z));
+    };
+    const others: { x: number; z: number }[] = [];
+    this.bodies.forEach((other, j) => {
+      if (j === i) return;
+      others.push({ x: other.position.x, z: other.position.z });
+      const dest = this.control[j].scripted?.toP;
+      if (dest) others.push({ x: dest.x, z: dest.z });
+    });
+    for (let iteration = 0; iteration < 40; iteration++) {
+      clamp();
       let moved = false;
-      this.bodies.forEach((other, j) => {
-        if (j === i) return;
-        const dx = p.x - other.position.x;
-        const dz = p.z - other.position.z;
+      for (const o of others) {
+        const dx = p.x - o.x;
+        const dz = p.z - o.z;
         const d = Math.hypot(dx, dz);
         if (d < 1.47) {
           const k = (1.47 - d + 0.01) / Math.max(d, 1e-3);
@@ -825,10 +944,22 @@ export class DiceSimulation {
           p.z += (d > 1e-3 ? dz : 0) * k;
           moved = true;
         }
-      });
+      }
       if (!moved) break;
     }
+    // The move's path is clamped to the same limits, so ending here never jumps.
+    clamp();
     return p;
+  }
+
+  /**
+   * Recovery may only take over a die that is supported (on the felt, or
+   * resting on something), never one in flight.
+   */
+  private grounded(i: number): boolean {
+    const b = this.bodies[i];
+    if (Math.abs(b.velocity.y) > 1.5) return false;
+    return b.position.y < DIE_HALF + 0.18 || b.velocity.length() < 0.5;
   }
 
   /**
@@ -841,8 +972,21 @@ export class DiceSimulation {
     const c = this.control[i];
     const s = c.scripted!;
     const body = this.bodies[i];
-    const u = Math.min(1, (t - s.start) / s.duration);
-    const e = u * u * (3 - 2 * u);
+    const elapsed = t - s.start;
+    const u = Math.min(1, elapsed / s.duration);
+    // Progress through the move: quarter rolls follow the tipping profile;
+    // a move with almost no rotation (e.g. sliding off a neighbour) eases.
+    let e: number;
+    if (s.angle > 0.05) {
+      const perQuarter = (s.duration / Math.max(1, s.angle / (Math.PI / 2))) || QUARTER_PROFILE.duration;
+      const scale = QUARTER_PROFILE.duration / perQuarter;
+      const q = Math.floor((elapsed * scale) / QUARTER_PROFILE.duration);
+      const within = elapsed * scale - q * QUARTER_PROFILE.duration;
+      e = Math.min(1, (q * (Math.PI / 2) + quarterAngle(within)) / s.angle);
+    } else {
+      e = u * u * (3 - 2 * u);
+    }
+    if (u >= 1) e = 1;
     const q = new Quaternion().slerpQuaternions(s.fromQ, s.toQ, e);
     const p = new Vector3().lerpVectors(s.fromP, s.toP, e);
     // Keep rotating corners off the walls: the allowed margin grows from where
@@ -865,8 +1009,12 @@ export class DiceSimulation {
     body.position.set(s.toP.x, DIE_HALF, s.toP.z);
     body.type = Body.DYNAMIC;
     body.velocity.set(0, 0, 0);
+    // Land with a small rock that dies away, far below what could tip it again.
+    const rock = s.angle > 0.05 ? 0.9 : 0;
+    body.angularVelocity.set(s.axis.x * rock, 0, s.axis.z * rock);
     body.angularDamping = 0.85;
     body.linearDamping = 0.35;
+    if (s.angle > 0.05) this.recordImpact(i, 5.5, 'felt');
     c.scripted = null;
     c.status = 'caught';
     c.restSteps = 0;
@@ -887,7 +1035,12 @@ export class DiceSimulation {
         // Out of time: every die not yet resting on its face takes the recovery
         // move now. Moves already under way simply finish; nothing jumps.
         this.control.forEach((c, i) => {
-          if (!c.scripted && !this.dieAtRestOnTarget(i) && !(c.status === 'caught' && this.targetNormal(i).y > 0.99)) {
+          if (
+            !c.scripted &&
+            !this.dieAtRestOnTarget(i) &&
+            !(c.status === 'caught' && this.targetNormal(i).y > 0.99) &&
+            this.grounded(i)
+          ) {
             this.beginScripted(i, 'hardstop');
           }
         });
@@ -913,6 +1066,7 @@ export class DiceSimulation {
 
   /** Immediately completes any unresolved die with its scripted recovery, then finishes. */
   private forceFinish(): void {
+    this.stats.forced += 1;
     for (let i = 0; i < 6; i++) {
       const c = this.control[i];
       if (!c.scripted && !this.dieAtRestOnTarget(i)) this.beginScripted(i);

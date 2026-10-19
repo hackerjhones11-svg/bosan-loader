@@ -32,6 +32,7 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
     let ticker: ReturnType<typeof setInterval> | null = null;
     let active: RollRecord | null = null;
     let handled: string | null = null;
+    let token = -1;
 
     const clearAll = () => {
       timers.forEach(clearTimeout);
@@ -40,14 +41,15 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
       ticker = null;
     };
 
-    const finish = (roll: RollRecord) => {
+    const finish = (roll: RollRecord, silent = false) => {
       clearAll();
       active = null;
       setFaces([...roll.faces]);
       setTumbling(Array(6).fill(false));
       soundEngine.endRoll();
       rollStore.markSettling(roll.id);
-      if (rollStore.completeRoll(roll.id)) soundEngine.playReveal();
+      // No chime for a roll finished in a hidden tab.
+      if (rollStore.completeRoll(roll.id) && !silent) soundEngine.playReveal();
     };
 
     const start = (roll: RollRecord) => {
@@ -59,7 +61,7 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
         timers.push(setTimeout(() => finish(roll), ms(ROLL_TIMING.reducedOut + ROLL_TIMING.reducedIn)));
         return;
       }
-      soundEngine.beginRoll();
+      token = soundEngine.beginRoll();
       const stopped = Array(6).fill(false);
       const began = performance.now();
       setTumbling(Array(6).fill(true));
@@ -101,8 +103,8 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
     };
     const onVisibility = () => {
       if (document.hidden && active) {
-        soundEngine.stopAll();
-        finish(active);
+        soundEngine.release(token);
+        finish(active, true);
       }
     };
 
@@ -113,7 +115,7 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
     return () => {
       unsubscribe();
       clearAll();
-      soundEngine.stopAll();
+      soundEngine.release(token);
       document.removeEventListener('visibilitychange', onVisibility);
       uiStore.set({ rendererReady: false, renderer: null });
     };
