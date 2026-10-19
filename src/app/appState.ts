@@ -40,6 +40,11 @@ export const uiStore = createMiniStore<UiState>({
   helpOpen: false,
 });
 
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+  // Dev-only handle for automated checks of audio scheduling.
+  (window as unknown as { __sound?: typeof soundEngine }).__sound = soundEngine;
+}
+
 // Keep history in sync when another tab of the app rolls or clears.
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (event) => {

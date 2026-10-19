@@ -1,23 +1,28 @@
 import { HISTORY_LIMIT, loadHistory, saveHistory } from './history';
 import { cryptoFill, type RandomFill } from './random';
 import { createRollRecord, isFaces, rollFairFaces, type Faces, type RollRecord } from './roll';
+import { REVEAL_MS } from './rollTiming';
 import { createMemoryStorage, type KeyValueStorage } from './storage';
 
 /**
  * Roll lifecycle:
  *
- *   idle ──requestRoll──▶ rolling ──markSettling──▶ settling ──completeRoll──▶ result
+ *   idle ──requestRoll──▶ rolling ──markSettling──▶ settling ──completeRoll──▶ revealing ──(timer)──▶ result
  *   result ──requestRoll──▶ rolling …
  *
  * - The outcome is fixed in requestRoll(), *before* any animation starts.
  *   Renderers only animate toward `activeRoll.faces`; they never decide a result.
- * - While rolling/settling every further requestRoll() is rejected, so buttons,
- *   keyboard, touch and admin triggers all share one guard.
+ * - completeRoll() is called once the dice are confirmed at rest on those faces.
+ *   It records history and starts the short reveal; the store itself ends the
+ *   reveal after `revealMs`, so a renderer can never leave the app stuck.
+ * - While rolling/settling/revealing every further requestRoll() is rejected, so
+ *   buttons, keyboard, touch and admin triggers all share one guard.
  * - completeRoll() is idempotent per roll id: history gets exactly one entry.
  * - A watchdog completes the roll with the already-selected result if a renderer
- *   never reports back (crash, lost WebGL context, throttled tab).
+ *   stops reporting (crash, lost WebGL context, throttled tab). A renderer that
+ *   is still making progress on a slow device calls keepAlive() to defer it.
  */
-export type RollPhase = 'idle' | 'rolling' | 'settling' | 'result';
+export type RollPhase = 'idle' | 'rolling' | 'settling' | 'revealing' | 'result';
 
 export interface RollState {
   readonly phase: RollPhase;
@@ -39,8 +44,12 @@ export interface RollStore {
   /** Starts a roll if none is active. Returns the new record, or null when busy. */
   requestRoll(): RollRecord | null;
   markSettling(rollId: string): boolean;
-  /** Finalises the active roll. Returns false for stale or duplicate calls. */
+  /** A renderer still making progress on this roll: restarts the watchdog. */
+  keepAlive(rollId: string): boolean;
+  /** Finalises the active roll and starts its reveal. Returns false for stale or duplicate calls. */
   completeRoll(rollId: string, options?: { recovered?: boolean }): boolean;
+  /** Ends the reveal early (normally the store's own timer does this). */
+  finishReveal(rollId: string): boolean;
   setPendingOverride(faces: Faces | null): void;
   clearHistory(): void;
   /** Re-reads persisted history (e.g. after another tab changed it). */
@@ -53,19 +62,31 @@ export interface RollStoreOptions {
   fill?: RandomFill;
   now?: () => number;
   watchdogMs?: number;
+  /** Length of the result reveal, during which Roll stays unavailable. */
+  revealMs?: number;
 }
 
-export const DEFAULT_WATCHDOG_MS = 9000;
+/** Comfortably longer than the slowest roll including its bounded recovery. */
+export const DEFAULT_WATCHDOG_MS = 12000;
 
 export function isBusy(state: RollState): boolean {
+  return state.phase === 'rolling' || state.phase === 'settling' || state.phase === 'revealing';
+}
+
+function isMoving(state: RollState): boolean {
   return state.phase === 'rolling' || state.phase === 'settling';
+}
+
+/** A finished roll whose counts are on screen (being revealed or fully shown). */
+export function hasShownResult(state: RollState): boolean {
+  return (state.phase === 'revealing' || state.phase === 'result') && state.lastResult !== null;
 }
 
 /** Whether the screen must currently show the TEST MODE disclosure. */
 export function testModeVisible(state: RollState): boolean {
   if (state.pendingOverride) return true;
   if (state.activeRoll?.mode === 'test') return true;
-  return state.phase === 'result' && state.lastResult?.mode === 'test';
+  return hasShownResult(state) && state.lastResult?.mode === 'test';
 }
 
 export function createRollStore(options: RollStoreOptions = {}): RollStore {
@@ -73,6 +94,7 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
   const fill = options.fill ?? cryptoFill;
   const now = options.now ?? Date.now;
   const watchdogMs = options.watchdogMs ?? DEFAULT_WATCHDOG_MS;
+  const revealMs = options.revealMs ?? REVEAL_MS;
 
   let state: RollState = {
     phase: 'idle',
@@ -84,6 +106,7 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
   };
   const listeners = new Set<() => void>();
   let watchdog: ReturnType<typeof setTimeout> | null = null;
+  let revealTimer: ReturnType<typeof setTimeout> | null = null;
 
   const set = (patch: Partial<RollState>) => {
     state = { ...state, ...patch };
@@ -93,6 +116,16 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
   const clearWatchdog = () => {
     if (watchdog !== null) clearTimeout(watchdog);
     watchdog = null;
+  };
+
+  const armWatchdog = (rollId: string) => {
+    clearWatchdog();
+    watchdog = setTimeout(() => store.completeRoll(rollId, { recovered: true }), watchdogMs);
+  };
+
+  const clearRevealTimer = () => {
+    if (revealTimer !== null) clearTimeout(revealTimer);
+    revealTimer = null;
   };
 
   const store: RollStore = {
@@ -110,10 +143,15 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
       const roll = override
         ? createRollRecord(override, 'test', now())
         : createRollRecord(rollFairFaces(fill), 'random', now());
-      clearWatchdog();
-      watchdog = setTimeout(() => store.completeRoll(roll.id, { recovered: true }), watchdogMs);
+      armWatchdog(roll.id);
       set({ phase: 'rolling', activeRoll: roll, pendingOverride: null, recovered: false });
       return roll;
+    },
+
+    keepAlive(rollId) {
+      if (!isMoving(state) || state.activeRoll?.id !== rollId) return false;
+      armWatchdog(rollId);
+      return true;
     },
 
     markSettling(rollId) {
@@ -124,11 +162,20 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
 
     completeRoll(rollId, opts) {
       const roll = state.activeRoll;
-      if (!isBusy(state) || !roll || roll.id !== rollId) return false;
+      if (!isMoving(state) || !roll || roll.id !== rollId) return false;
       clearWatchdog();
+      clearRevealTimer();
       const history = [roll, ...state.history.filter((r) => r.id !== roll.id)].slice(0, HISTORY_LIMIT);
       saveHistory(storage, history);
-      set({ phase: 'result', activeRoll: null, lastResult: roll, history, recovered: Boolean(opts?.recovered) });
+      revealTimer = setTimeout(() => store.finishReveal(roll.id), revealMs);
+      set({ phase: 'revealing', activeRoll: null, lastResult: roll, history, recovered: Boolean(opts?.recovered) });
+      return true;
+    },
+
+    finishReveal(rollId) {
+      if (state.phase !== 'revealing' || state.lastResult?.id !== rollId) return false;
+      clearRevealTimer();
+      set({ phase: 'result' });
       return true;
     },
 
@@ -148,6 +195,7 @@ export function createRollStore(options: RollStoreOptions = {}): RollStore {
 
     dispose() {
       clearWatchdog();
+      clearRevealTimer();
       listeners.clear();
     },
   };

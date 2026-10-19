@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { PMREMGenerator, type PerspectiveCamera } from 'three';
+import { PMREMGenerator, type Group, type PerspectiveCamera } from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { uiStore, useRollState } from '../app/appState';
 import { isBusy } from '../game/rollStore';
@@ -88,14 +88,18 @@ function Scene({ reducedMotion, onReady }: { reducedMotion: boolean; onReady: ()
     if (!busy && preset !== desired) setPreset(desired);
   }, [busy, desired, preset]);
   const dims = TRAY_PRESETS[preset];
+  // Tray and dice share one rig that trembles slightly with the shake; the camera stays put.
+  const rig = useRef<Group>(null);
 
   return (
     <>
       <CameraRig dims={dims} />
       <LocalEnvironment />
       <Lighting dims={dims} />
-      <Tray dims={dims} />
-      <DiceSet dims={dims} reducedMotion={reducedMotion} />
+      <group ref={rig}>
+        <Tray dims={dims} />
+        <DiceSet dims={dims} reducedMotion={reducedMotion} rig={rig} />
+      </group>
       <FirstFrame onReady={onReady} />
     </>
   );

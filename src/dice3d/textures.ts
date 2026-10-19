@@ -117,6 +117,22 @@ export function createBlobShadowTexture(size = 128): CanvasTexture {
   return finish(canvas, false);
 }
 
+/**
+ * Soft warm glow for the result halo under matching dice: a gentle radial
+ * falloff rather than a ring, so it reads as light on the felt.
+ */
+export function createHaloTexture(size = 128): CanvasTexture {
+  const [canvas, ctx] = makeCanvas(size, size);
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0, 'rgba(255, 216, 150, 0.85)');
+  g.addColorStop(0.38, 'rgba(240, 190, 105, 0.55)');
+  g.addColorStop(0.7, 'rgba(214, 160, 80, 0.16)');
+  g.addColorStop(1, 'rgba(200, 150, 70, 0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return finish(canvas);
+}
+
 export function disposeTextures(...textures: (Texture | null | undefined)[]): void {
   for (const t of textures) t?.dispose();
 }

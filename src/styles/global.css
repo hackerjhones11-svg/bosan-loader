@@ -470,7 +470,55 @@ button {
 
 .tile.is-hit .tile-count {
   color: var(--ink);
-  animation: count-pop 0.45s ease-out;
+}
+
+/* Staged reveal: each tile turns over a beat after the previous one
+   (--reveal-delay is set per tile from ROLL_TIMING). Leaving the result
+   state has no delay, so tiles go quiet immediately when a new roll starts. */
+.mat.has-result .tile {
+  transition-delay: var(--reveal-delay, 0s);
+}
+
+.mat.has-result .tile-symbol {
+  transition-delay: var(--reveal-delay, 0s);
+}
+
+.mat.has-result .tile-count {
+  animation: count-in 0.42s cubic-bezier(0.2, 0.8, 0.3, 1.2) var(--reveal-delay, 0s) both;
+}
+
+.mat.has-result .tile.is-zero .tile-count {
+  animation: count-fade 0.35s ease-out var(--reveal-delay, 0s) both;
+}
+
+/* A single, restrained pulse for symbols that came up more than once. */
+.mat.has-result .tile.is-multi {
+  animation: multi-pulse 0.9s ease-out calc(var(--reveal-delay, 0s) + 0.12s) 1 both;
+}
+
+.mat-summary {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text);
+  text-align: right;
+  animation: count-fade 0.4s ease-out 0.62s both;
+}
+
+.summary-item {
+  white-space: nowrap;
+}
+
+.summary-item.is-multi {
+  color: var(--gold-bright);
+  font-weight: 650;
+}
+
+.summary-times {
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-dot {
+  color: var(--text-muted);
 }
 
 .tile.is-hit .tile-symbol {
@@ -502,17 +550,43 @@ button {
   background: var(--ink);
 }
 
-@keyframes count-pop {
+@keyframes count-in {
   0% {
-    transform: scale(0.6);
+    transform: scale(0.55);
     opacity: 0;
-  }
-  60% {
-    transform: scale(1.12);
-    opacity: 1;
   }
   100% {
     transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes count-fade {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes multi-pulse {
+  0% {
+    box-shadow:
+      0 0 0 1px var(--gold),
+      0 0 0 0 rgba(230, 196, 119, 0.55);
+  }
+  45% {
+    box-shadow:
+      0 0 0 1px var(--gold),
+      0 0 0 7px rgba(230, 196, 119, 0.12);
+  }
+  100% {
+    box-shadow:
+      0 0 0 1px var(--gold),
+      0 6px 18px rgba(201, 165, 90, 0.16);
   }
 }
 

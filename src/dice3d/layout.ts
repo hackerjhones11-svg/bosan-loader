@@ -1,7 +1,7 @@
 import { Quaternion, Vector3 } from 'three';
 import type { SymbolId } from '../game/symbols';
 import { restQuaternion } from './faceMap';
-import type { DiePose } from './rollPlanner';
+import type { DiePose } from './diceSimulation';
 import { DIE_HALF, type TrayDims } from './trayConfig';
 
 /** Two yaw-rotated unit cubes on the felt cannot overlap if centres are ≥ √2 apart. */

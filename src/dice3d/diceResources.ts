@@ -1,10 +1,9 @@
 import {
+  AdditiveBlending,
   Color,
-  DoubleSide,
   MeshBasicMaterial,
   MeshPhysicalMaterial,
   PlaneGeometry,
-  RingGeometry,
   Vector3,
   type BufferGeometry,
   type Texture,
@@ -12,13 +11,13 @@ import {
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { SYMBOL_IDS } from '../game/symbols';
+import { VISUAL_CORNER_RADIUS } from './dieCollider';
 import { FACE_LAYOUT, atlasUvRect, decalQuaternion } from './faceMap';
 import { DIE_HALF, DIE_SIZE } from './trayConfig';
-import { DIE_IVORY, createBlobShadowTexture, createSymbolAtlas } from './textures';
+import { DIE_IVORY, createBlobShadowTexture, createHaloTexture, createSymbolAtlas } from './textures';
 
-const CORNER_RADIUS = 0.11;
 /** The flat part of each rounded face is DIE_SIZE - 2·radius; the decal sits just inside it. */
-const DECAL_SIZE = DIE_SIZE - 2 * CORNER_RADIUS - 0.01;
+const DECAL_SIZE = DIE_SIZE - 2 * VISUAL_CORNER_RADIUS - 0.01;
 const DECAL_LIFT = 0.0015;
 
 /**
@@ -46,89 +45,97 @@ function createFaceGeometry(atlasCellPx: number): BufferGeometry {
   return merged;
 }
 
+/** Per-die materials: emphasis (body edge glow, halo, contact shadow) differs die to die. */
+export interface DieMaterials {
+  body: MeshPhysicalMaterial;
+  shadow: MeshBasicMaterial;
+  halo: MeshBasicMaterial;
+}
+
 export interface DiceResources {
   bodyGeometry: BufferGeometry;
   faceGeometry: BufferGeometry;
-  bodyMaterial: MeshPhysicalMaterial;
   faceMaterial: MeshPhysicalMaterial;
   shadowGeometry: BufferGeometry;
-  shadowMaterial: MeshBasicMaterial;
-  ringGeometry: BufferGeometry;
-  ringMaterial: MeshBasicMaterial;
-  /** Sets the brief warm glow used to highlight a fresh result (0 = off). */
-  setGlow(amount: number): void;
+  haloGeometry: BufferGeometry;
+  perDie: DieMaterials[];
   dispose(): void;
 }
 
-/** Shared by all six dice: one body geometry, one face geometry, one atlas. */
+/**
+ * Shared by all six dice: one body geometry, one face geometry and one symbol
+ * atlas. The face decals share a single material. Each die owns a cheap clone
+ * of the body, shadow and halo materials, so the result emphasis (a warm glow
+ * on the rounded ivory edges, never on the symbols) can differ per die.
+ */
 export function createDiceResources(): DiceResources {
   const cellPx = 256;
   const atlas: Texture = createSymbolAtlas(cellPx);
   atlas.anisotropy = 4;
   const shadowTexture = createBlobShadowTexture();
+  const haloTexture = createHaloTexture();
 
-  const common = {
-    roughness: 0.4,
-    metalness: 0,
-    clearcoat: 0.35,
-    clearcoatRoughness: 0.32,
-    emissive: new Color('#ffcf7a'),
+  const surface = { roughness: 0.4, metalness: 0, clearcoat: 0.35, clearcoatRoughness: 0.32 };
+  const bodyMaterial = new MeshPhysicalMaterial({
+    ...surface,
+    color: new Color(DIE_IVORY),
+    emissive: new Color('#f3c56f'),
     emissiveIntensity: 0,
-  };
-  const bodyMaterial = new MeshPhysicalMaterial({ ...common, color: new Color(DIE_IVORY) });
+  });
   const faceMaterial = new MeshPhysicalMaterial({
-    ...common,
+    ...surface,
     color: new Color('#ffffff'),
     map: atlas,
     polygonOffset: true,
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -1,
   });
-
-  const shadowGeometry = new PlaneGeometry(1.7, 1.7).rotateX(-Math.PI / 2);
   const shadowMaterial = new MeshBasicMaterial({
     map: shadowTexture,
     transparent: true,
     depthWrite: false,
     color: new Color('#04140e'),
   });
-
-  const ringGeometry = new RingGeometry(0.8, 0.9, 48).rotateX(-Math.PI / 2);
-  const ringMaterial = new MeshBasicMaterial({
-    color: new Color('#d9b45f'),
+  const haloMaterial = new MeshBasicMaterial({
+    map: haloTexture,
     transparent: true,
-    opacity: 0.95,
+    opacity: 0,
     depthWrite: false,
-    side: DoubleSide,
+    blending: AdditiveBlending,
   });
 
-  const bodyGeometry = new RoundedBoxGeometry(DIE_SIZE, DIE_SIZE, DIE_SIZE, 4, CORNER_RADIUS);
+  const perDie: DieMaterials[] = Array.from({ length: 6 }, () => ({
+    body: bodyMaterial.clone(),
+    shadow: shadowMaterial.clone(),
+    halo: haloMaterial.clone(),
+  }));
+
+  const bodyGeometry = new RoundedBoxGeometry(DIE_SIZE, DIE_SIZE, DIE_SIZE, 4, VISUAL_CORNER_RADIUS);
   const faceGeometry = createFaceGeometry(cellPx);
+  const shadowGeometry = new PlaneGeometry(1.7, 1.7).rotateX(-Math.PI / 2);
+  const haloGeometry = new PlaneGeometry(2.3, 2.3).rotateX(-Math.PI / 2);
 
   return {
     bodyGeometry,
     faceGeometry,
-    bodyMaterial,
     faceMaterial,
     shadowGeometry,
-    shadowMaterial,
-    ringGeometry,
-    ringMaterial,
-    setGlow(amount) {
-      bodyMaterial.emissiveIntensity = amount;
-      faceMaterial.emissiveIntensity = amount;
-    },
+    haloGeometry,
+    perDie,
     dispose() {
       bodyGeometry.dispose();
       faceGeometry.dispose();
       shadowGeometry.dispose();
-      ringGeometry.dispose();
-      bodyMaterial.dispose();
-      faceMaterial.dispose();
-      shadowMaterial.dispose();
-      ringMaterial.dispose();
+      haloGeometry.dispose();
+      for (const m of [bodyMaterial, faceMaterial, shadowMaterial, haloMaterial]) m.dispose();
+      for (const d of perDie) {
+        d.body.dispose();
+        d.shadow.dispose();
+        d.halo.dispose();
+      }
       atlas.dispose();
       shadowTexture.dispose();
+      haloTexture.dispose();
     },
   };
 }

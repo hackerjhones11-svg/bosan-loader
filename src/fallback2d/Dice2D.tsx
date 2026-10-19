@@ -2,24 +2,26 @@ import { useEffect, useRef, useState } from 'react';
 import { rollStore, uiStore, useRollState, useUi } from '../app/appState';
 import { soundEngine } from '../audio/soundEngine';
 import type { RollRecord } from '../game/roll';
+import { hasShownResult } from '../game/rollStore';
+import { ROLL_TIMING } from '../game/rollTiming';
 import { SYMBOL_IDS, type SymbolId } from '../game/symbols';
 import { SymbolIcon } from '../components/SymbolIcon';
 import { visualRandom } from '../dice3d/visualRandom';
 
-const FLICKER_MS = 85;
-const FIRST_STOP_MS = 620;
-const STOP_STAGGER_MS = 110;
+const FLICKER_MS = 90;
 
 /**
- * 2D fallback when WebGL is unavailable (or `?renderer=2d`). Uses the same
- * roll store, so outcomes are the same fair crypto draws. The flicker during
- * a roll is cosmetic (visualRandom); each card then stops on its recorded face.
+ * 2D fallback when WebGL is unavailable (or `?renderer=2d`). Same store and
+ * fair engine, same rhythm as the 3D tray (ROLL_TIMING): cards jostle and
+ * flicker while the "box" is shaken, then stop one by one on their recorded
+ * faces as the shake dies away. The flicker is cosmetic (visualRandom); the
+ * stops always show `roll.faces`.
  */
 export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; notice: string | null }) {
   const [faces, setFaces] = useState<SymbolId[]>(() => [...(rollStore.getState().lastResult?.faces ?? SYMBOL_IDS)]);
   const [tumbling, setTumbling] = useState<boolean[]>(() => Array(6).fill(false));
   const hovered = useUi((s) => s.hoveredSymbol);
-  const phase = useRollState((s) => s.phase);
+  const showRings = useRollState(hasShownResult);
   const reducedRef = useRef(reducedMotion);
   useEffect(() => {
     reducedRef.current = reducedMotion;
@@ -27,15 +29,15 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
 
   useEffect(() => {
     let timers: ReturnType<typeof setTimeout>[] = [];
-    let flicker: ReturnType<typeof setInterval> | null = null;
+    let ticker: ReturnType<typeof setInterval> | null = null;
     let active: RollRecord | null = null;
     let handled: string | null = null;
 
     const clearAll = () => {
       timers.forEach(clearTimeout);
       timers = [];
-      if (flicker !== null) clearInterval(flicker);
-      flicker = null;
+      if (ticker !== null) clearInterval(ticker);
+      ticker = null;
     };
 
     const finish = (roll: RollRecord) => {
@@ -43,39 +45,53 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
       active = null;
       setFaces([...roll.faces]);
       setTumbling(Array(6).fill(false));
+      soundEngine.endRoll();
       rollStore.markSettling(roll.id);
-      if (rollStore.completeRoll(roll.id)) soundEngine.playSettle();
+      if (rollStore.completeRoll(roll.id)) soundEngine.playReveal();
     };
 
     const start = (roll: RollRecord) => {
       handled = roll.id;
       active = roll;
       clearAll();
+      const ms = (s: number) => Math.round(s * 1000);
       if (reducedRef.current) {
-        timers.push(setTimeout(() => finish(roll), 220));
+        timers.push(setTimeout(() => finish(roll), ms(ROLL_TIMING.reducedOut + ROLL_TIMING.reducedIn)));
         return;
       }
+      soundEngine.beginRoll();
       const stopped = Array(6).fill(false);
+      const began = performance.now();
       setTumbling(Array(6).fill(true));
-      soundEngine.playRoll(
-        Array.from({ length: 6 }, (_, i) => ({ t: (FIRST_STOP_MS + i * STOP_STAGGER_MS) / 1000, strength: 5, surface: 'felt' as const })),
-        0,
-        true,
-      );
-      flicker = setInterval(() => {
+      // Stops are spread across the coast and settle window, in a random order.
+      const order = [0, 1, 2, 3, 4, 5].sort(() => visualRandom() - 0.5);
+      const span = ROLL_TIMING.settleAssistFrom + 0.45 - (ROLL_TIMING.shakeEnd + 0.2);
+      const stopAt = (rank: number) => ROLL_TIMING.shakeEnd + 0.2 + (span * rank) / 5;
+
+      ticker = setInterval(() => {
+        const t = (performance.now() - began) / 1000;
+        const vigour = t < ROLL_TIMING.buildUp ? t / ROLL_TIMING.buildUp : t < ROLL_TIMING.shakeEnd ? 1 : 0.35;
+        const moving = stopped.filter((s) => !s).length / 6;
+        soundEngine.setActivity(vigour * moving, vigour * moving * 0.8);
+        if (visualRandom() < 0.35 * vigour * moving) {
+          const die = Math.floor(visualRandom() * 6);
+          soundEngine.impact(0, 3 + visualRandom() * 6, visualRandom() < 0.6 ? 'die' : 'wall', die);
+        }
         setFaces((prev) => prev.map((f, i) => (stopped[i] ? f : SYMBOL_IDS[Math.floor(visualRandom() * 6)])));
       }, FLICKER_MS);
-      for (let i = 0; i < 6; i++) {
+
+      order.forEach((die, rank) => {
         timers.push(
           setTimeout(() => {
-            stopped[i] = true;
-            setFaces((prev) => prev.map((f, j) => (j === i ? roll.faces[i] : f)));
-            setTumbling((prev) => prev.map((v, j) => (j === i ? false : v)));
-          }, FIRST_STOP_MS + i * STOP_STAGGER_MS),
+            stopped[die] = true;
+            soundEngine.impact(0, 5 - rank * 0.5, 'felt', die);
+            setFaces((prev) => prev.map((f, j) => (j === die ? roll.faces[die] : f)));
+            setTumbling((prev) => prev.map((v, j) => (j === die ? false : v)));
+          }, ms(stopAt(rank))),
         );
-      }
-      timers.push(setTimeout(() => rollStore.markSettling(roll.id), FIRST_STOP_MS + 2 * STOP_STAGGER_MS));
-      timers.push(setTimeout(() => finish(roll), FIRST_STOP_MS + 5 * STOP_STAGGER_MS + 260));
+      });
+      timers.push(setTimeout(() => rollStore.markSettling(roll.id), ms(ROLL_TIMING.shakeEnd)));
+      timers.push(setTimeout(() => finish(roll), ms(stopAt(5) + 0.18)));
     };
 
     const sync = () => {
@@ -84,7 +100,10 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
       else if (!state.activeRoll && active) finish(active);
     };
     const onVisibility = () => {
-      if (document.hidden && active) finish(active);
+      if (document.hidden && active) {
+        soundEngine.stopAll();
+        finish(active);
+      }
     };
 
     sync();
@@ -94,12 +113,11 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
     return () => {
       unsubscribe();
       clearAll();
+      soundEngine.stopAll();
       document.removeEventListener('visibilitychange', onVisibility);
       uiStore.set({ rendererReady: false, renderer: null });
     };
   }, []);
-
-  const showRings = phase === 'result';
 
   return (
     <div className="stage2d">

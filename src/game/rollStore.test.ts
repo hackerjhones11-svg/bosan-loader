@@ -12,10 +12,12 @@ const cycling: RandomFill = (target) => {
   for (let i = 0; i < target.length; i++) target[i] = i % 6;
 };
 
+/** Settles, completes and ends the reveal, leaving the store ready for the next roll. */
 function finish(store: ReturnType<typeof createRollStore>) {
   const roll = store.getState().activeRoll!;
   store.markSettling(roll.id);
   store.completeRoll(roll.id);
+  store.finishReveal(roll.id);
   return roll;
 }
 
@@ -24,8 +26,9 @@ afterEach(() => {
 });
 
 describe('state machine', () => {
-  it('walks idle → rolling → settling → result', () => {
-    const store = createRollStore({ fill: cycling });
+  it('walks idle → rolling → settling → revealing → result', () => {
+    vi.useFakeTimers();
+    const store = createRollStore({ fill: cycling, revealMs: 800 });
     expect(store.getState().phase).toBe('idle');
     const roll = store.requestRoll()!;
     expect(store.getState().phase).toBe('rolling');
@@ -33,10 +36,29 @@ describe('state machine', () => {
     expect(store.markSettling(roll.id)).toBe(true);
     expect(store.getState().phase).toBe('settling');
     expect(store.completeRoll(roll.id)).toBe(true);
-    const state = store.getState();
-    expect(state.phase).toBe('result');
+    let state = store.getState();
+    expect(state.phase).toBe('revealing');
     expect(state.activeRoll).toBeNull();
     expect(state.lastResult).toBe(roll);
+    expect(state.history[0]).toBe(roll);
+    vi.advanceTimersByTime(799);
+    expect(store.getState().phase).toBe('revealing');
+    vi.advanceTimersByTime(1);
+    state = store.getState();
+    expect(state.phase).toBe('result');
+    expect(state.lastResult).toBe(roll);
+    store.dispose();
+  });
+
+  it('records history once when the dice are confirmed, not when the reveal ends', () => {
+    vi.useFakeTimers();
+    const store = createRollStore({ fill: cycling });
+    const roll = store.requestRoll()!;
+    store.completeRoll(roll.id);
+    expect(store.getState().history.map((r) => r.id)).toEqual([roll.id]);
+    vi.runAllTimers();
+    expect(store.getState().history.map((r) => r.id)).toEqual([roll.id]);
+    expect(store.finishReveal(roll.id)).toBe(false);
     store.dispose();
   });
 
@@ -61,7 +83,22 @@ describe('busy-state protection', () => {
     expect(store.requestRoll()).toBeNull();
     expect(store.getState().activeRoll?.id).toBe(first!.id);
     store.completeRoll(first!.id);
+    // The reveal is part of the roll: still guarded until it ends.
+    expect(store.getState().phase).toBe('revealing');
+    expect(isBusy(store.getState())).toBe(true);
+    expect(store.requestRoll()).toBeNull();
+    store.finishReveal(first!.id);
     expect(store.requestRoll()).not.toBeNull();
+    store.dispose();
+  });
+
+  it('a stale reveal end cannot affect a later roll', () => {
+    const store = createRollStore({ fill: cycling });
+    const first = finish((store.requestRoll(), store));
+    const second = store.requestRoll()!;
+    expect(store.finishReveal(first.id)).toBe(false);
+    expect(store.getState().phase).toBe('rolling');
+    expect(store.getState().activeRoll?.id).toBe(second.id);
     store.dispose();
   });
 
@@ -92,11 +129,29 @@ describe('busy-state protection', () => {
     expect(store.getState().phase).toBe('rolling');
     vi.advanceTimersByTime(1);
     const state = store.getState();
-    expect(state.phase).toBe('result');
+    expect(state.phase).toBe('revealing');
     expect(state.lastResult?.id).toBe(roll.id);
     expect(state.lastResult?.faces).toEqual(roll.faces);
     expect(state.recovered).toBe(true);
     expect(state.history).toHaveLength(1);
+    vi.runAllTimers();
+    expect(store.getState().phase).toBe('result');
+    store.dispose();
+  });
+
+  it('a renderer still making progress defers the watchdog', () => {
+    vi.useFakeTimers();
+    const store = createRollStore({ fill: cycling, watchdogMs: 5000 });
+    const roll = store.requestRoll()!;
+    for (let k = 0; k < 4; k++) {
+      vi.advanceTimersByTime(4000);
+      expect(store.keepAlive(roll.id)).toBe(true);
+    }
+    expect(store.getState().phase).toBe('rolling');
+    vi.advanceTimersByTime(5000);
+    expect(store.getState().phase).toBe('revealing');
+    expect(store.getState().recovered).toBe(true);
+    expect(store.keepAlive(roll.id)).toBe(false);
     store.dispose();
   });
 
@@ -165,6 +220,8 @@ describe('admin test overrides', () => {
     store.setPendingOverride(PRESET);
     const forced = store.requestRoll()!;
     store.completeRoll(forced.id);
+    expect(testModeVisible(store.getState())).toBe(true);
+    store.finishReveal(forced.id);
     finish((store.requestRoll(), store));
     store.dispose();
 

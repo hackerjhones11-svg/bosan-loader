@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { rollStore, prefsStore } from '../app/appState';
 import { rankedCounts } from '../game/roll';
+import { hasShownResult } from '../game/rollStore';
 import { formatCount, STRINGS, symbolSpokenName } from '../i18n/strings';
 
 /**
@@ -14,8 +15,9 @@ export function LiveAnnouncer() {
   useEffect(() => {
     let frame = 0;
     const check = () => {
-      const { phase, lastResult } = rollStore.getState();
-      if (phase !== 'result' || !lastResult || announced.current === lastResult.id) return;
+      const state = rollStore.getState();
+      const { lastResult } = state;
+      if (!hasShownResult(state) || !lastResult || announced.current === lastResult.id) return;
       announced.current = lastResult.id;
       const { lang } = prefsStore.get();
       const t = STRINGS[lang];

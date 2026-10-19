@@ -1,17 +1,16 @@
 import { useFrame, useThree } from '@react-three/fiber';
-import { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Quaternion, Vector3, type Group, type Mesh, type MeshBasicMaterial } from 'three';
+import { useEffect, useLayoutEffect, useMemo, useRef, type RefObject } from 'react';
+import { Quaternion, Vector3, type Group, type Mesh } from 'three';
 import { rollStore, uiStore } from '../app/appState';
 import { soundEngine } from '../audio/soundEngine';
-import type { RollRecord } from '../game/roll';
+import { countFaces, type Faces, type RollRecord } from '../game/roll';
+import { ROLL_TIMING } from '../game/rollTiming';
 import { SYMBOL_IDS, type SymbolId } from '../game/symbols';
 import { createDiceResources } from './diceResources';
-import { upwardFace } from './faceMap';
+import { DiceSimulation, type DiePose } from './diceSimulation';
+import { FACE_LAYOUT, restQuaternion, upwardFace } from './faceMap';
 import { clonePoses, fitPosesToTray, gridLayout } from './layout';
-import { RollAnimation } from './rollAnimation';
-import { planProcedural, planRoll, type DiePose } from './rollPlanner';
 import { DIE_HALF, type TrayDims } from './trayConfig';
-import { visualRandom } from './visualRandom';
 
 declare global {
   interface Window {
@@ -19,50 +18,90 @@ declare global {
       rollId: string;
       upward: (SymbolId | null)[];
       flatness: number[];
-      source: string;
-      attempts: number;
-      seconds: number;
+      restAt: number | null;
+      paths: number[];
+      impacts: { die: number; wall: number; felt: number };
+      stats: unknown;
     };
   }
 }
 
-const GLOW_SECONDS = 0.9;
-const GLOW_PEAK = 0.2;
+/** Simulate this far ahead of the frame being drawn, so impacts can be scheduled precisely. */
+const LEAD = 1 / 60;
+/**
+ * Physics time budget per frame (ms). Stepping is cheap, so this normally
+ * keeps pace even when rendering is slow; if it cannot, playback slows down
+ * instead of skipping, and a single long stall never triggers a burst of work.
+ */
+const PHYSICS_BUDGET_MS = 6;
+/** How quickly halos and edge glow ease toward their target (per second). */
+const EASE_RATE = 9;
 
-interface ActiveAnimation {
-  anim: RollAnimation;
-  /** Set on the first rendered frame, so a stall before it (shader compile, slow device) can't eat the tumble. */
+interface LiveRoll {
+  roll: RollRecord;
+  sim: DiceSimulation | null;
+  /** Reduced motion: dip out at the old poses, return at these. */
+  reduced: { from: DiePose[]; to: DiePose[] } | null;
+  /** performance.now() of the first rendered frame (null until then). */
   start: number | null;
+  heard: number;
   settlingSent: boolean;
+  /** Last keep-alive sent to the store's watchdog. */
+  lastAlive: number;
+}
+
+interface Reveal {
+  start: number;
+  /** Halo strength each die settles at (0 for symbols that came up once). */
+  level: number[];
+  chimed: boolean;
+}
+
+/** Yaw of a resting die, measured the way restQuaternion() applies it. */
+function yawOf(q: Quaternion): number {
+  const { symbol } = upwardFace(q);
+  const up = new Vector3(...FACE_LAYOUT[symbol].up).applyQuaternion(q);
+  return Math.atan2(-up.x, -up.z);
+}
+
+function smooth(x: number): number {
+  const t = Math.min(1, Math.max(0, x));
+  return t * t * (3 - 2 * t);
 }
 
 /**
- * The six dice. Rendering state lives in refs and is written straight to the
- * Three.js objects each frame; React never re-renders during a roll.
+ * The six dice. All per-frame work writes straight to Three.js objects; React
+ * never re-renders during a roll.
  *
- * Synchronisation with the roll store:
- * - A new `activeRoll` starts a planned animation toward exactly its faces.
- * - Crossing `settleAt` calls markSettling; reaching the end calls completeRoll.
- * - If the store completes the roll first (watchdog), or the tab is hidden,
- *   the dice jump to the plan's final poses, which already show the recorded faces.
+ * A roll plays a live DiceSimulation (diceSimulation.ts): each frame advances
+ * the fixed-step physics a little ahead of the clock, draws the interpolated
+ * poses, trembles the tray by the same shake signal that drives the physics,
+ * and hands new collisions to the sound engine. When the simulation confirms
+ * all six dice at rest on their recorded faces, the store is told
+ * (completeRoll → revealing) and the reveal plays: a short hold, then warm
+ * halos under dice whose symbol came up more than once, with a one-time glow
+ * along their ivory edges. The dice never move again until the next roll.
  */
-export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion: boolean }) {
+export function DiceSet({
+  dims,
+  reducedMotion,
+  rig,
+}: {
+  dims: TrayDims;
+  reducedMotion: boolean;
+  rig: RefObject<Group | null>;
+}) {
   const invalidate = useThree((s) => s.invalidate);
   const resources = useMemo(() => createDiceResources(), []);
-  const shadowMaterials = useMemo(
-    () => Array.from({ length: 6 }, () => resources.shadowMaterial.clone() as MeshBasicMaterial),
-    [resources],
-  );
 
   const dieRefs = useRef<(Group | null)[]>([]);
   const shadowRefs = useRef<(Mesh | null)[]>([]);
-  const ringRefs = useRef<(Mesh | null)[]>([]);
+  const haloRefs = useRef<(Mesh | null)[]>([]);
   const dimsRef = useRef(dims);
   const reducedRef = useRef(reducedMotion);
-  const animRef = useRef<ActiveAnimation | null>(null);
-  /** Id of the last roll this renderer has taken charge of, so each roll starts exactly once. */
-  const handledRollRef = useRef<string | null>(null);
-  const glowStartRef = useRef<number | null>(null);
+  const liveRef = useRef<LiveRoll | null>(null);
+  const revealRef = useRef<Reveal | null>(null);
+  const handledRef = useRef<string | null>(null);
   const shownFacesRef = useRef<readonly SymbolId[] | null>(null);
   const restRef = useRef<DiePose[] | null>(null);
   if (restRef.current === null) {
@@ -71,18 +110,15 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
     restRef.current = gridLayout(last ? last.faces : SYMBOL_IDS, dims);
   }
 
-  const scratch = useMemo(
-    () => ({
-      positions: Array.from({ length: 6 }, () => new Vector3()),
-      quaternions: Array.from({ length: 6 }, () => new Quaternion()),
-    }),
-    [],
-  );
-
-  // All per-frame and event logic lives in one stable controller object so
-  // callbacks never capture stale state.
   const controller = useMemo(() => {
-    const applyPoses = (positions: readonly Vector3[], quaternions: readonly Quaternion[], scale: number) => {
+    const P = Array.from({ length: 6 }, () => new Vector3());
+    const Q = Array.from({ length: 6 }, () => new Quaternion());
+    const halo = Array(6).fill(0);
+    const glow = Array(6).fill(0);
+    const offset = { x: 0, y: 0, z: 0 };
+    let lastFrame = 0;
+
+    const applyPoses = (positions: readonly Vector3[], quaternions: readonly Quaternion[], scale = 1) => {
       for (let i = 0; i < 6; i++) {
         const die = dieRefs.current[i];
         if (die) {
@@ -90,13 +126,14 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
           die.quaternion.copy(quaternions[i]);
           die.scale.setScalar(scale);
         }
+        const height = Math.max(0, positions[i].y - DIE_HALF);
         const shadow = shadowRefs.current[i];
         if (shadow) {
-          const height = Math.max(0, positions[i].y - DIE_HALF);
           shadow.position.set(positions[i].x, 0.004, positions[i].z);
           shadow.scale.setScalar((1 + height * 0.35) * scale);
-          shadowMaterials[i].opacity = Math.max(0, 1 - height * 0.32) * scale;
         }
+        resources.perDie[i].shadow.opacity = Math.max(0, 1 - height * 0.32) * scale;
+        haloRefs.current[i]?.position.set(positions[i].x, 0.006, positions[i].z);
       }
     };
 
@@ -105,126 +142,233 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
       applyPoses(
         rest.map((p) => p.position),
         rest.map((p) => p.quaternion),
-        1,
       );
+      rig.current?.position.set(0, 0, 0);
     };
 
-    const updateRings = () => {
+    /** Halo and edge-glow targets for this instant; returns true while still changing. */
+    const updateEmphasis = (now: number, dt: number): boolean => {
+      const reveal = revealRef.current;
       const hovered = uiStore.get().hoveredSymbol;
-      const faces = animRef.current ? null : shownFacesRef.current;
-      const rest = restRef.current!;
+      const faces = liveRef.current ? null : shownFacesRef.current;
+      let moving = false;
       for (let i = 0; i < 6; i++) {
-        const ring = ringRefs.current[i];
-        if (!ring) continue;
-        ring.visible = Boolean(faces && hovered && faces[i] === hovered);
-        ring.position.set(rest[i].position.x, 0.006, rest[i].position.z);
+        let haloTarget = 0;
+        let glowTarget = 0;
+        if (faces && reveal) {
+          const r = (now - reveal.start) / 1000 - ROLL_TIMING.revealHold;
+          const level = reveal.level[i];
+          if (r > 0 && level > 0) {
+            // Rise, a single gentle swell for repeated symbols, then hold.
+            haloTarget = level * (smooth(r / 0.35) + 0.35 * Math.sin(Math.PI * smooth((r - 0.1) / 0.55)));
+            glowTarget = 0.16 * Math.sin(Math.PI * smooth(r / 0.6));
+            if (r < 0.9) moving = true;
+          }
+        }
+        if (faces && hovered && faces[i] === hovered) haloTarget = Math.max(haloTarget, 0.8);
+        const k = 1 - Math.exp(-EASE_RATE * dt);
+        halo[i] += (haloTarget - halo[i]) * k;
+        glow[i] += (glowTarget - glow[i]) * k;
+        if (Math.abs(haloTarget - halo[i]) > 0.004 || Math.abs(glowTarget - glow[i]) > 0.002) moving = true;
+        resources.perDie[i].halo.opacity = halo[i];
+        resources.perDie[i].body.emissiveIntensity = glow[i];
+        const mesh = haloRefs.current[i];
+        if (mesh) mesh.visible = halo[i] > 0.003;
       }
-      invalidate();
+      return moving;
     };
 
-    const complete = (active: ActiveAnimation, now: number) => {
-      const { anim } = active;
-      restRef.current = clonePoses(anim.plan.finalPoses);
-      animRef.current = null;
-      shownFacesRef.current = anim.plan.faces;
+    const startReveal = (faces: Faces, now: number) => {
+      const counts = countFaces(faces);
+      revealRef.current = {
+        start: now,
+        level: faces.map((f) => (counts[f] >= 2 ? Math.min(0.85, 0.5 + 0.12 * (counts[f] - 2)) : 0)),
+        chimed: false,
+      };
+    };
+
+    /** Dice are confirmed at rest on the recorded faces: hand over to the reveal. */
+    const finishLive = (live: LiveRoll, now: number) => {
+      const final = live.sim ? live.sim.finalPoses() : live.reduced!.to;
+      restRef.current = clonePoses(final);
+      liveRef.current = null;
+      shownFacesRef.current = live.roll.faces;
       applyRest();
-      glowStartRef.current = now;
-      if (!active.settlingSent) rollStore.markSettling(anim.rollId);
-      soundEngine.playSettle();
-      rollStore.completeRoll(anim.rollId);
+      soundEngine.endRoll();
+      if (!live.settlingSent) rollStore.markSettling(live.roll.id);
+      rollStore.completeRoll(live.roll.id);
+      startReveal(live.roll.faces, now);
       if (import.meta.env.DEV) {
         // Dev-only verification hook: what the rendered meshes actually show.
         window.__diceDebug = {
-          rollId: anim.rollId,
+          rollId: live.roll.id,
           upward: dieRefs.current.map((g) => (g ? upwardFace(g.quaternion).symbol : null)),
           flatness: dieRefs.current.map((g) => (g ? upwardFace(g.quaternion).alignment : 0)),
-          source: anim.plan.source,
-          attempts: anim.plan.attempts,
-          seconds: anim.total,
+          restAt: live.sim?.restAt ?? null,
+          paths: live.sim?.pathLengths() ?? [],
+          impacts: {
+            die: live.sim?.impacts.filter((e) => e.surface === 'die').length ?? 0,
+            wall: live.sim?.impacts.filter((e) => e.surface === 'wall').length ?? 0,
+            felt: live.sim?.impacts.filter((e) => e.surface === 'felt').length ?? 0,
+          },
+          stats: live.sim?.stats ?? null,
         };
       }
-      updateRings();
       invalidate();
     };
 
     const start = (roll: RollRecord) => {
-      handledRollRef.current = roll.id;
-      const dimsNow = dimsRef.current;
+      handledRef.current = roll.id;
+      revealRef.current = null;
+      const from = restRef.current!;
       try {
-        let plan;
-        try {
-          plan = planRoll(roll.faces, dimsNow);
-        } catch (error) {
-          console.error('[dice] planner failed; using procedural tumble', error);
-          plan = planProcedural(roll.faces, dimsNow, visualRandom);
+        if (reducedRef.current) {
+          const to = from.map((p, i) => ({
+            position: p.position.clone(),
+            quaternion: restQuaternion(roll.faces[i], yawOf(p.quaternion)),
+          }));
+          liveRef.current = {
+            roll,
+            sim: null,
+            reduced: { from: clonePoses(from), to },
+            start: null,
+            heard: 0,
+            settlingSent: false,
+            lastAlive: 0,
+          };
+        } else {
+          const sim = new DiceSimulation(roll.faces, dimsRef.current, from);
+          liveRef.current = { roll, sim, reduced: null, start: null, heard: 0, settlingSent: false, lastAlive: 0 };
         }
-        const anim = new RollAnimation(roll.id, plan, restRef.current!, reducedRef.current);
-        animRef.current = { anim, start: null, settlingSent: false };
-        glowStartRef.current = null;
-        resources.setGlow(0);
-        updateRings();
-        invalidate();
       } catch (error) {
-        // Last resort: show the already-recorded result immediately and release the UI.
-        console.error('[dice] animation failed; showing recorded result', error);
-        animRef.current = null;
-        restRef.current = gridLayout(roll.faces, dimsNow);
+        // Last resort: show the already-recorded result in place and release the UI.
+        console.error('[dice] could not start the roll; showing the recorded result', error);
+        liveRef.current = null;
+        restRef.current = from.map((p, i) => ({
+          position: p.position.clone(),
+          quaternion: restQuaternion(roll.faces[i], yawOf(p.quaternion)),
+        }));
         shownFacesRef.current = roll.faces;
         applyRest();
         rollStore.markSettling(roll.id);
         rollStore.completeRoll(roll.id, { recovered: true });
-        invalidate();
       }
+      invalidate();
     };
 
-    /** Jump to the end of the current animation (final faces are already known). */
+    /** Completes the current roll immediately (tab hidden, store watchdog). */
     const finishNow = () => {
-      const active = animRef.current;
-      if (!active) return;
+      const live = liveRef.current;
+      if (!live) return;
       soundEngine.stopAll();
-      active.anim.sample(Infinity, scratch.positions, scratch.quaternions);
-      complete(active, performance.now());
+      if (live.sim) {
+        live.sim.runToEnd();
+        live.sim.repair(live.sim.wrongDice());
+        live.sim.runToEnd();
+      }
+      finishLive(live, performance.now());
     };
 
     const frame = () => {
       const now = performance.now();
-      const active = animRef.current;
-      if (active) {
-        if (active.start === null) {
-          active.start = now;
-          // Scheduled from the same instant as the visuals so impacts line up.
-          if (!active.anim.reduced) soundEngine.playRoll(active.anim.plan.impacts, active.anim.throwStart, true);
+      const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+      lastFrame = now;
+      let again = false;
+      const live = liveRef.current;
+
+      if (live) {
+        if (live.start === null) {
+          live.start = now;
+          if (live.sim) soundEngine.beginRoll();
         }
-        const t = (now - active.start) / 1000;
-        const { scale, done } = active.anim.sample(t, scratch.positions, scratch.quaternions);
-        applyPoses(scratch.positions, scratch.quaternions, scale);
-        if (!active.settlingSent && t >= active.anim.settleAt) {
-          active.settlingSent = true;
-          rollStore.markSettling(active.anim.rollId);
-        }
-        if (done) complete(active, now);
-        else invalidate();
-      }
-      const glowStart = glowStartRef.current;
-      if (glowStart !== null) {
-        const g = (now - glowStart) / 1000 / GLOW_SECONDS;
-        if (g >= 1) {
-          glowStartRef.current = null;
-          resources.setGlow(0);
+        let t = (now - live.start) / 1000;
+
+        if (live.sim) {
+          const sim = live.sim;
+          sim.advanceTo(t + LEAD, now + PHYSICS_BUDGET_MS);
+          if (now - live.lastAlive > 1000) {
+            live.lastAlive = now;
+            rollStore.keepAlive(live.roll.id);
+          }
+          if (!sim.done && sim.time < t) {
+            // Physics fell behind (slow device, long frame): slow the playback
+            // down rather than skipping ahead, so no motion or sound is lost.
+            live.start += (t - sim.time) * 1000;
+            t = sim.time;
+          }
+          const shown = sim.done ? Math.min(t, sim.restAt!) : t;
+          for (let i = 0; i < 6; i++) sim.sample(i, shown, P[i], Q[i]);
+          applyPoses(P, Q);
+          sim.shake.offset(shown, offset);
+          rig.current?.position.set(offset.x, 0, offset.z);
+
+          // Collisions that have now been simulated, scheduled at their exact time.
+          const impacts = sim.impacts;
+          while (live.heard < impacts.length && impacts[live.heard].t <= sim.time) {
+            const e = impacts[live.heard++];
+            const delay = e.t - t;
+            if (delay > -0.05) soundEngine.impact(Math.max(0, delay), e.strength, e.surface, e.die);
+          }
+          const activity = sim.activity(shown);
+          soundEngine.setActivity(activity.rattle, activity.slide);
+
+          if (!live.settlingSent && t >= ROLL_TIMING.shakeEnd) {
+            live.settlingSent = true;
+            rollStore.markSettling(live.roll.id);
+          }
+          if (sim.done && t >= sim.restAt!) {
+            // Defensive re-check before anything is revealed (never expected to fire).
+            const wrong = sim.wrongDice();
+            if (wrong.length) {
+              console.error('[dice] resting face mismatch; recovering', wrong);
+              sim.repair(wrong);
+              again = true;
+            } else {
+              finishLive(live, now);
+            }
+          } else {
+            again = true;
+          }
         } else {
-          resources.setGlow(Math.sin(Math.PI * g) * GLOW_PEAK);
+          // Reduced motion: a quick dip, the faces change out of sight, and back.
+          const { from, to } = live.reduced!;
+          const out = ROLL_TIMING.reducedOut;
+          if (t < out) {
+            from.forEach((p, i) => (P[i].copy(p.position), Q[i].copy(p.quaternion)));
+            applyPoses(P, Q, Math.max(0.001, 1 - smooth(t / out)));
+            again = true;
+          } else if (t < out + ROLL_TIMING.reducedIn) {
+            to.forEach((p, i) => (P[i].copy(p.position), Q[i].copy(p.quaternion)));
+            applyPoses(P, Q, Math.max(0.001, smooth((t - out) / ROLL_TIMING.reducedIn)));
+            if (!live.settlingSent) {
+              live.settlingSent = true;
+              rollStore.markSettling(live.roll.id);
+              for (let i = 0; i < 6; i += 2) soundEngine.impact(0.04 * i, 3.5, 'felt', i);
+            }
+            again = true;
+          } else {
+            finishLive(live, now);
+          }
         }
-        invalidate();
       }
+
+      const reveal = revealRef.current;
+      if (reveal && !reveal.chimed && (now - reveal.start) / 1000 >= ROLL_TIMING.revealHold) {
+        reveal.chimed = true;
+        soundEngine.playReveal();
+      }
+      if (updateEmphasis(now, dt)) again = true;
+      if (reveal && !reveal.chimed) again = true;
+      if (again) invalidate();
+      else lastFrame = 0;
     };
 
     const syncWithStore = () => {
       const state = rollStore.getState();
-      const active = animRef.current;
-      if (state.activeRoll && state.activeRoll.id !== handledRollRef.current) {
-        if (active) finishNow();
+      if (state.activeRoll && state.activeRoll.id !== handledRef.current) {
+        if (liveRef.current) finishNow();
         start(state.activeRoll);
-      } else if (!state.activeRoll && active) {
+      } else if (!state.activeRoll && liveRef.current) {
         // The store finished this roll without us (watchdog recovery).
         finishNow();
       }
@@ -232,14 +376,14 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
 
     const relayout = (next: TrayDims) => {
       dimsRef.current = next;
-      if (animRef.current) return;
+      if (liveRef.current) return;
       restRef.current = fitPosesToTray(restRef.current!, next);
       applyRest();
-      updateRings();
+      invalidate();
     };
 
-    return { applyRest, updateRings, frame, syncWithStore, finishNow, relayout };
-  }, [invalidate, resources, scratch, shadowMaterials]);
+    return { applyRest, frame, syncWithStore, finishNow, relayout, refresh: () => invalidate() };
+  }, [invalidate, resources, rig]);
 
   useEffect(() => {
     reducedRef.current = reducedMotion;
@@ -251,13 +395,12 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
 
   useLayoutEffect(() => {
     controller.applyRest();
-    controller.updateRings();
     controller.syncWithStore();
     const unsubscribeRoll = rollStore.subscribe(controller.syncWithStore);
-    const unsubscribeUi = uiStore.subscribe(controller.updateRings);
+    const unsubscribeUi = uiStore.subscribe(controller.refresh);
     const onVisibility = () => {
-      // Hidden tabs get no animation frames; finish on the recorded result
-      // rather than replaying a stale tumble when the user returns.
+      // Hidden tabs get no frames: finish on the recorded result rather than
+      // replaying a stale tumble (or a burst of queued steps and sounds) later.
       if (document.hidden) controller.finishNow();
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -265,16 +408,11 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
       unsubscribeRoll();
       unsubscribeUi();
       document.removeEventListener('visibilitychange', onVisibility);
+      soundEngine.stopAll();
     };
   }, [controller]);
 
-  useEffect(
-    () => () => {
-      resources.dispose();
-      for (const m of shadowMaterials) m.dispose();
-    },
-    [resources, shadowMaterials],
-  );
+  useEffect(() => () => resources.dispose(), [resources]);
 
   useFrame(controller.frame);
 
@@ -283,19 +421,19 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
       {Array.from({ length: 6 }, (_, i) => (
         <group key={i}>
           <group ref={(el) => void (dieRefs.current[i] = el)}>
-            <mesh geometry={resources.bodyGeometry} material={resources.bodyMaterial} castShadow receiveShadow />
+            <mesh geometry={resources.bodyGeometry} material={resources.perDie[i].body} castShadow receiveShadow />
             <mesh geometry={resources.faceGeometry} material={resources.faceMaterial} receiveShadow />
           </group>
           <mesh
             ref={(el) => void (shadowRefs.current[i] = el)}
             geometry={resources.shadowGeometry}
-            material={shadowMaterials[i]}
+            material={resources.perDie[i].shadow}
             renderOrder={1}
           />
           <mesh
-            ref={(el) => void (ringRefs.current[i] = el)}
-            geometry={resources.ringGeometry}
-            material={resources.ringMaterial}
+            ref={(el) => void (haloRefs.current[i] = el)}
+            geometry={resources.haloGeometry}
+            material={resources.perDie[i].halo}
             visible={false}
             renderOrder={2}
           />

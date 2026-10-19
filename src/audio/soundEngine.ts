@@ -1,47 +1,123 @@
+import { visualRandom } from '../dice3d/visualRandom';
+
 /**
- * Procedural dice sounds via Web Audio: no audio files, no network.
+ * Procedural dice audio via Web Audio: no files, no network, no autoplay.
  *
- * - The AudioContext is created lazily inside a user gesture (unlock()), so
- *   nothing ever autoplays.
- * - Every public method swallows errors: audio problems must never block or
- *   delay a roll.
- * - Impacts are scheduled on the audio clock from the physics plan's collision
- *   times, so sounds line up with what is on screen.
+ * Layers, all driven by what the dice are physically doing:
+ * - impact(): one short percussive voice per real collision reported by the
+ *   simulation: bright clacks for die-on-die, woody knocks for the rim,
+ *   muffled taps for the felt. Volume follows impact speed, pitch varies a
+ *   little, repeats per die are throttled and simultaneous voices are capped.
+ * - setActivity(): a soft felt "slide" bed plus tiny irregular rattle grains
+ *   whose density follows how vigorously the dice are moving, so the texture
+ *   builds with the shake, thins as the dice coast, and is silent at rest.
+ *
+ * Everything goes through a per-roll bus into a compressor, so a new roll,
+ * mute, tab switch or unmount can silence all of it at once and loud
+ * clusters never clip. Every public method swallows errors: audio is
+ * optional and must never block a roll.
  */
 
 export type ImpactKind = 'die' | 'wall' | 'felt';
 
-export interface ScheduledImpact {
-  /** Seconds after the throw begins. */
-  t: number;
-  strength: number;
-  surface: ImpactKind;
+/** Minimum gap between two sounds from the same die on the same kind of surface. */
+const PER_DIE_GAP = 0.035;
+/** Hard cap on overlapping voices. */
+const MAX_VOICES = 18;
+/** Impacts softer than this (die units / s along the normal) are inaudible. */
+const MIN_STRENGTH: Record<ImpactKind, number> = { die: 0.7, wall: 0.9, felt: 1.2 };
+/** Strength at which a voice reaches full level. */
+const FULL_STRENGTH: Record<ImpactKind, number> = { die: 14, wall: 16, felt: 18 };
+
+interface Tone {
+  band: number;
+  q: number;
+  noiseDecay: number;
+  partials: readonly (readonly [ratio: number, gain: number, decay: number])[];
+  base: number;
+  level: number;
+  lowpass: number;
 }
 
-interface Voice {
-  stop(): void;
-}
+// Modal partials are deliberately inharmonic so impacts read as solid
+// objects rather than musical notes.
+const TONES: Record<ImpactKind, Tone> = {
+  die: {
+    band: 3300,
+    q: 2.4,
+    noiseDecay: 0.022,
+    base: 2150,
+    partials: [
+      [1, 0.32, 0.045],
+      [1.61, 0.16, 0.028],
+      [2.37, 0.07, 0.018],
+    ],
+    level: 0.5,
+    lowpass: 9000,
+  },
+  wall: {
+    band: 1350,
+    q: 1.4,
+    noiseDecay: 0.032,
+    base: 560,
+    partials: [
+      [1, 0.36, 0.075],
+      [2.31, 0.14, 0.045],
+      [3.9, 0.05, 0.025],
+    ],
+    level: 0.55,
+    lowpass: 5200,
+  },
+  felt: {
+    band: 520,
+    q: 0.9,
+    noiseDecay: 0.03,
+    base: 175,
+    partials: [
+      [1, 0.4, 0.055],
+      [2.7, 0.08, 0.03],
+    ],
+    level: 0.38,
+    lowpass: 1500,
+  },
+};
 
 class SoundEngine {
   private ctx: AudioContext | null = null;
-  private master: GainNode | null = null;
+  private output: GainNode | null = null;
   private noise: AudioBuffer | null = null;
-  private current: GainNode | null = null;
+  private bus: GainNode | null = null;
+  private bed: { source: AudioBufferSourceNode; gain: GainNode; filter: BiquadFilterNode } | null = null;
+  private voiceEnds: number[] = [];
+  private lastByKey = new Map<string, number>();
+  private grainDebt = 0;
+  private lastActivityAt = 0;
+  /** Counters for verification and tuning (cheap; never affect playback). */
+  readonly stats = { impacts: 0, grains: 0, dropped: 0, lastVoiceAt: 0, lastImpactAt: 0, rolls: 0, bedPeak: 0 };
   enabled = true;
 
-  /** Call synchronously from a click/keydown handler. */
+  /** Call synchronously from a click/keydown handler so browsers allow playback. */
   unlock(): void {
     if (!this.enabled) return;
     try {
       if (!this.ctx) {
         const Ctor: typeof AudioContext | undefined =
-          globalThis.AudioContext ?? (globalThis as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          globalThis.AudioContext ??
+          (globalThis as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
         if (!Ctor) return;
-        this.ctx = new Ctor();
-        this.master = this.ctx.createGain();
-        this.master.gain.value = 0.55;
-        this.master.connect(this.ctx.destination);
-        this.noise = this.makeNoise(this.ctx);
+        const ctx = new Ctor();
+        const compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.value = -20;
+        compressor.knee.value = 14;
+        compressor.ratio.value = 4;
+        compressor.attack.value = 0.003;
+        compressor.release.value = 0.14;
+        const output = ctx.createGain();
+        output.gain.value = 0.62;
+        output.connect(compressor).connect(ctx.destination);
+        this.ctx = ctx;
+        this.output = output;
+        this.noise = this.makeNoise(ctx, 2.5);
       }
       if (this.ctx.state === 'suspended') void this.ctx.resume().catch(() => {});
     } catch {
@@ -54,126 +130,236 @@ class SoundEngine {
     if (!enabled) this.stopAll();
   }
 
-  private makeNoise(ctx: AudioContext): AudioBuffer {
-    const length = Math.floor(ctx.sampleRate * 0.25);
+  private makeNoise(ctx: AudioContext, seconds: number): AudioBuffer {
+    const length = Math.floor(ctx.sampleRate * seconds);
     const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
     const data = buffer.getChannelData(0);
-    // Deterministic LCG noise: this is texture for a sound, not randomness for outcomes.
-    let seed = 22695477;
-    for (let i = 0; i < length; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      data[i] = (seed / 0x7fffffff) * 2 - 1;
-    }
+    for (let i = 0; i < length; i++) data[i] = visualRandom() * 2 - 1;
     return buffer;
   }
 
-  private ready(): { ctx: AudioContext; bus: GainNode; noise: AudioBuffer } | null {
-    if (!this.enabled || !this.ctx || !this.master || !this.noise || this.ctx.state === 'closed') return null;
-    if (!this.current) {
-      this.current = this.ctx.createGain();
-      this.current.connect(this.master);
+  private live(): { ctx: AudioContext; bus: GainNode; noise: AudioBuffer } | null {
+    if (!this.enabled || !this.ctx || !this.output || !this.noise || this.ctx.state === 'closed') return null;
+    if (!this.bus) {
+      this.bus = this.ctx.createGain();
+      this.bus.connect(this.output);
     }
-    return { ctx: this.ctx, bus: this.current, noise: this.noise };
+    return { ctx: this.ctx, bus: this.bus, noise: this.noise };
   }
 
-  private click(at: number, strength: number, surface: ImpactKind): void {
-    const r = this.ready();
+  private claimVoice(at: number, length: number): boolean {
+    this.voiceEnds = this.voiceEnds.filter((end) => end > at);
+    if (this.voiceEnds.length >= MAX_VOICES) {
+      this.stats.dropped += 1;
+      return false;
+    }
+    this.voiceEnds.push(at + length);
+    this.stats.lastVoiceAt = Math.max(this.stats.lastVoiceAt, at);
+    return true;
+  }
+
+  /** Current audio clock (s), or null before audio has been unlocked. */
+  now(): number | null {
+    return this.ctx ? this.ctx.currentTime : null;
+  }
+
+  /** Whether the continuous slide/rattle texture is currently running. */
+  get textureActive(): boolean {
+    return this.bed !== null;
+  }
+
+  private voice(at: number, kind: ImpactKind, level: number, brightness = 1): void {
+    const r = this.live();
     if (!r) return;
     const { ctx, bus, noise } = r;
-    const level = Math.min(1, strength / 9);
-    if (level < 0.04) return;
-    const tone = {
-      die: { band: 3100, q: 5, decay: 0.035, pitch: 2150, gain: 0.5 },
-      wall: { band: 1250, q: 3.2, decay: 0.06, pitch: 520, gain: 0.55 },
-      felt: { band: 700, q: 1.4, decay: 0.05, pitch: 190, gain: 0.32 },
-    }[surface];
-    const jitter = 0.92 + ((at * 7919) % 1) * 0.16;
+    const tone = TONES[kind];
+    const longest = Math.max(tone.noiseDecay, ...tone.partials.map((p) => p[2])) + 0.03;
+    if (!this.claimVoice(at, longest)) return;
+    const pitch = (0.93 + visualRandom() * 0.14) * brightness;
 
+    const strike = ctx.createGain();
+    const lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = tone.lowpass * (0.6 + 0.4 * level);
+    strike.connect(lowpass).connect(bus);
+
+    // Transient: a few milliseconds of band-limited noise.
     const src = ctx.createBufferSource();
     src.buffer = noise;
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'bandpass';
-    filter.frequency.value = tone.band * jitter;
-    filter.Q.value = tone.q;
-    const env = ctx.createGain();
-    env.gain.setValueAtTime(0, at);
-    env.gain.linearRampToValueAtTime(tone.gain * level, at + 0.002);
-    env.gain.exponentialRampToValueAtTime(0.0001, at + tone.decay);
-    src.connect(filter).connect(env).connect(bus);
-    src.start(at, ((at * 1000) % 200) / 1000, tone.decay + 0.02);
+    const band = ctx.createBiquadFilter();
+    band.type = 'bandpass';
+    band.frequency.value = tone.band * pitch;
+    band.Q.value = tone.q;
+    const nEnv = ctx.createGain();
+    nEnv.gain.setValueAtTime(0, at);
+    nEnv.gain.linearRampToValueAtTime(tone.level * level, at + 0.0015);
+    nEnv.gain.exponentialRampToValueAtTime(0.0001, at + tone.noiseDecay);
+    src.connect(band).connect(nEnv).connect(strike);
+    src.start(at, visualRandom() * (noise.duration - 0.2), tone.noiseDecay + 0.02);
 
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.value = tone.pitch * jitter;
-    const oscEnv = ctx.createGain();
-    oscEnv.gain.setValueAtTime(0, at);
-    oscEnv.gain.linearRampToValueAtTime(tone.gain * 0.35 * level, at + 0.002);
-    oscEnv.gain.exponentialRampToValueAtTime(0.0001, at + tone.decay * 1.4);
-    osc.connect(oscEnv).connect(bus);
-    osc.start(at);
-    osc.stop(at + tone.decay * 1.5 + 0.02);
-  }
-
-  /** Rattle while the dice are gathered, then the planned impacts. */
-  playRoll(impacts: readonly ScheduledImpact[], throwDelay: number, rattle: boolean): Voice {
-    const voice = { stop: () => this.stopAll() };
-    try {
-      this.stopAll();
-      const r = this.ready();
-      if (!r) return voice;
-      const start = r.ctx.currentTime + 0.02;
-      if (rattle) {
-        for (let i = 0; i < 7; i++) this.click(start + (i / 7) * throwDelay * 0.9, 2.5 + (i % 3), 'die');
-      }
-      // Busy throws produce dozens of contacts; cap voices so the mix stays crisp.
-      const sorted = [...impacts].sort((a, b) => b.strength - a.strength).slice(0, 36);
-      for (const impact of sorted) this.click(start + throwDelay + impact.t, impact.strength, impact.surface);
-    } catch {
-      // ignore: sound is optional
+    // Body: a few short, inharmonic modes.
+    for (const [ratio, gain, decay] of tone.partials) {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = tone.base * ratio * pitch;
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0, at);
+      env.gain.linearRampToValueAtTime(gain * tone.level * level, at + 0.001);
+      env.gain.exponentialRampToValueAtTime(0.0001, at + decay);
+      osc.connect(env).connect(strike);
+      osc.start(at);
+      osc.stop(at + decay + 0.02);
     }
-    return voice;
   }
 
-  /** Soft two-note wooden cue when the result is shown. */
-  playSettle(): void {
+  /** Starts a fresh bus for a new roll, fading out anything left from the last one. */
+  beginRoll(): void {
+    this.stopAll();
+    this.lastByKey.clear();
+    this.grainDebt = 0;
+    this.lastActivityAt = 0;
     try {
-      const r = this.ready();
+      const r = this.live();
+      if (!r) return;
+      this.stats.rolls += 1;
+      const { ctx, bus, noise } = r;
+      const source = ctx.createBufferSource();
+      source.buffer = noise;
+      source.loop = true;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.value = 900;
+      filter.Q.value = 0.8;
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      source.connect(filter).connect(gain).connect(bus);
+      source.start(ctx.currentTime, visualRandom() * noise.duration);
+      this.bed = { source, gain, filter };
+    } catch {
+      this.bed = null;
+    }
+  }
+
+  /**
+   * One collision, `delay` seconds from now (0 = immediately). Soft contacts,
+   * rapid repeats from the same die and anything beyond the voice cap are dropped.
+   */
+  impact(delay: number, strength: number, surface: ImpactKind, die: number): void {
+    try {
+      if (!this.live() || strength < MIN_STRENGTH[surface]) return;
+      const at = this.ctx!.currentTime + Math.max(0, delay) + 0.004;
+      const key = `${die}:${surface}`;
+      if (at - (this.lastByKey.get(key) ?? -1) < PER_DIE_GAP) {
+        this.stats.dropped += 1;
+        return;
+      }
+      this.lastByKey.set(key, at);
+      this.stats.impacts += 1;
+      this.stats.lastImpactAt = Math.max(this.stats.lastImpactAt, at);
+      const x = (strength - MIN_STRENGTH[surface]) / (FULL_STRENGTH[surface] - MIN_STRENGTH[surface]);
+      const level = Math.min(1, Math.max(0.05, x)) ** 0.75;
+      this.voice(at, surface, level, surface === 'die' ? 1 : 0.97 + level * 0.06);
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Continuous texture. `rattle` (0..1) is overall dice agitation, `slide` (0..1)
+   * how much they are skidding on the felt. Call once per rendered frame.
+   */
+  setActivity(rattle: number, slide: number): void {
+    try {
+      const r = this.live();
+      if (!r) return;
+      const now = r.ctx.currentTime;
+      const dt = this.lastActivityAt ? Math.min(0.1, now - this.lastActivityAt) : 0;
+      this.lastActivityAt = now;
+      if (this.bed) {
+        const level = Math.min(1, slide) ** 1.4 * 0.055;
+        this.stats.bedPeak = Math.max(this.stats.bedPeak, level);
+        this.bed.gain.gain.setTargetAtTime(level, now, 0.06);
+        this.bed.filter.frequency.setTargetAtTime(650 + 700 * Math.min(1, slide), now, 0.1);
+      }
+      // Irregular micro-clicks between the louder reported impacts.
+      this.grainDebt += Math.min(1, rattle) ** 1.3 * 38 * dt;
+      while (this.grainDebt >= 1) {
+        this.grainDebt -= 1;
+        const at = now + 0.01 + visualRandom() * Math.max(dt, 0.016);
+        this.stats.grains += 1;
+        this.voice(at, 'die', 0.05 + visualRandom() * 0.12 * rattle, 1.15 + visualRandom() * 0.35);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /** The dice are still: fade the texture; impacts already scheduled ring out. */
+  endRoll(): void {
+    try {
+      if (this.ctx && this.bed) {
+        const now = this.ctx.currentTime;
+        this.bed.gain.gain.cancelScheduledValues(now);
+        this.bed.gain.gain.setTargetAtTime(0, now, 0.05);
+        const bed = this.bed;
+        bed.source.stop(now + 0.4);
+      }
+    } catch {
+      // ignore
+    }
+    this.bed = null;
+    this.grainDebt = 0;
+  }
+
+  /** A soft, low wooden tone as the result is revealed. */
+  playReveal(): void {
+    try {
+      const r = this.live();
       if (!r) return;
       const { ctx, bus } = r;
       const t = ctx.currentTime + 0.01;
-      [
-        [587.33, 0],
-        [880, 0.07],
-      ].forEach(([freq, delay]) => {
+      for (const [freq, delay, gain] of [
+        [523.25, 0, 0.05],
+        [784, 0.09, 0.035],
+      ] as const) {
         const osc = ctx.createOscillator();
         osc.type = 'triangle';
         osc.frequency.value = freq;
         const env = ctx.createGain();
         env.gain.setValueAtTime(0, t + delay);
-        env.gain.linearRampToValueAtTime(0.07, t + delay + 0.005);
-        env.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.35);
+        env.gain.linearRampToValueAtTime(gain, t + delay + 0.006);
+        env.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.45);
         osc.connect(env).connect(bus);
         osc.start(t + delay);
-        osc.stop(t + delay + 0.4);
-      });
+        osc.stop(t + delay + 0.5);
+      }
     } catch {
       // ignore
     }
   }
 
-  /** Silences everything scheduled so far (tab hidden, mute, new roll). */
+  /** Silences everything immediately (new roll, mute, tab hidden, unmount). */
   stopAll(): void {
     try {
-      if (this.current && this.ctx) {
-        const old = this.current;
-        old.gain.setValueAtTime(old.gain.value, this.ctx.currentTime);
-        old.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.03);
+      this.bed?.source.stop();
+    } catch {
+      // ignore
+    }
+    this.bed = null;
+    try {
+      if (this.bus && this.ctx) {
+        const old = this.bus;
+        const now = this.ctx.currentTime;
+        old.gain.cancelScheduledValues(now);
+        old.gain.setValueAtTime(old.gain.value, now);
+        old.gain.linearRampToValueAtTime(0, now + 0.03);
         setTimeout(() => old.disconnect(), 80);
       }
     } catch {
       // ignore
     }
-    this.current = null;
+    this.bus = null;
+    this.voiceEnds = [];
   }
 }
 

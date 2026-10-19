@@ -11,7 +11,9 @@ export function RollPanel() {
   const ready = useUi((s) => s.rendererReady);
   const unavailable = busy || !ready;
 
+  // During the short reveal the button already reads "Roll Dice" but stays unavailable until it ends.
   const label = !ready ? t.preparing : phase === 'rolling' ? t.rolling : phase === 'settling' ? t.settling : t.roll;
+  const showSub = ready && (!busy || phase === 'revealing');
 
   return (
     <div className="roll-panel">
@@ -25,7 +27,7 @@ export function RollPanel() {
         }}
       >
         <span className="roll-main">{label}</span>
-        {!busy && ready && (
+        {showSub && (
           <span className="roll-sub" lang={lang === 'en' ? 'ne' : 'en'}>
             {t.rollOther}
           </span>
