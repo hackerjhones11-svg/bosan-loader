@@ -22,8 +22,8 @@ export const TRAY_PRESETS: Readonly<Record<TrayPreset, TrayDims>> = {
 };
 
 export function presetForAspect(aspect: number): TrayPreset {
-  if (aspect >= 1.3) return 'wide';
-  if (aspect >= 0.92) return 'square';
+  if (aspect >= 1.35) return 'wide';
+  if (aspect >= 1.0) return 'square';
   return 'tall';
 }
 

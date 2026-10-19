@@ -33,10 +33,11 @@ function HistoryRow({ roll }: { roll: RollRecord }) {
         ))}
       </div>
       <div className="history-summary" aria-hidden="true">
+        {/* Repeats carry their count; singles are icon-only so the row stays on one line. */}
         {summary.map(({ id, count }) => (
-          <span key={id} className={`chip${count > 1 ? ' is-multi' : ''}`}>
+          <span key={id} className={`chip${count > 1 ? ' is-multi' : ' is-single'}`}>
             <SymbolIcon id={id} size={14} />
-            {formatCount(count, lang)}
+            {count > 1 && formatCount(count, lang)}
           </span>
         ))}
       </div>

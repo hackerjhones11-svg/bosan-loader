@@ -2,7 +2,7 @@ import { MathUtils, Vector3, type PerspectiveCamera } from 'three';
 import { BASE_THICKNESS, RIM, type TrayDims } from './trayConfig';
 
 /** Elevated view: high enough that every top face reads clearly, low enough to feel like a table. */
-export const CAMERA_ELEVATION_DEG = 60;
+export const CAMERA_ELEVATION_DEG = 66;
 const MARGIN_X = 0.035;
 const MARGIN_Y = 0.045;
 

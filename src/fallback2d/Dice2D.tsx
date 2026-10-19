@@ -109,6 +109,7 @@ export function Dice2D({ reducedMotion, notice }: { reducedMotion: boolean; noti
           {faces.map((face, i) => (
             <li
               key={i}
+              data-symbol={face}
               className={`die2d${tumbling[i] ? ' is-tumbling' : ''}${showRings && hovered === face ? ' is-ringed' : ''}`}
               style={{ ['--i' as string]: i }}
             >

@@ -101,6 +101,14 @@ function Scene({ reducedMotion, onReady }: { reducedMotion: boolean; onReady: ()
   );
 }
 
+/** Dev-only switch (`?renderer=3d-fail`) to exercise the 3D → 2D recovery path. */
+function SimulatedFailure(): null {
+  if (import.meta.env.DEV && new URLSearchParams(window.location.search).get('renderer') === '3d-fail') {
+    throw new Error('Simulated 3D initialisation failure');
+  }
+  return null;
+}
+
 function maxDpr(): number {
   const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
   return Math.min(window.devicePixelRatio || 1, coarse ? 1.75 : 2);
@@ -141,6 +149,7 @@ export default function DiceStage3D({
         }}
         aria-hidden="true"
       >
+        <SimulatedFailure />
         <Scene reducedMotion={reducedMotion} onReady={() => setReady(true)} />
       </Canvas>
     </div>

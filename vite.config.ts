@@ -5,7 +5,9 @@ export default defineConfig({
   plugins: [react()],
   build: {
     target: 'es2022',
-    chunkSizeWarningLimit: 900,
+    // The lazily loaded 3D chunk (three.js + React Three Fiber + cannon-es, ~275 kB gzip)
+    // is the only large one; R3F references the whole THREE namespace, so it cannot shrink further.
+    chunkSizeWarningLimit: 1100,
   },
   test: {
     environment: 'node',

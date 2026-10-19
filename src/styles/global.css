@@ -444,7 +444,8 @@ button {
 }
 
 .tile.is-zero .tile-symbol {
-  opacity: 0.5;
+  opacity: 0.55;
+  filter: saturate(0.35);
 }
 
 .tile.is-zero .tile-count {
@@ -628,7 +629,7 @@ button {
 }
 
 .text-button {
-  min-height: 36px;
+  min-height: 40px;
   padding: 4px 10px;
   border: 0;
   border-radius: 8px;
@@ -721,7 +722,7 @@ button {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 4px;
+  gap: 3px;
 }
 
 .chip {
@@ -739,6 +740,10 @@ button {
 
 .chip.is-multi {
   background: var(--gold-bright);
+}
+
+.chip.is-single {
+  padding: 2px 4px;
 }
 
 .chip.is-zero {
@@ -1118,7 +1123,7 @@ button {
   }
 
   .stage {
-    height: clamp(280px, 54dvh, 560px);
+    height: clamp(260px, 47dvh, 540px);
     border-radius: 16px;
   }
 
@@ -1134,6 +1139,11 @@ button {
   .tile-symbol {
     width: 40px;
     height: 40px;
+  }
+
+  /* The count badge already marks repeats; pips are dropped to keep the mat above the Roll bar. */
+  .tile-pips {
+    display: none;
   }
 
   .roll-panel {

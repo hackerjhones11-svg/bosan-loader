@@ -31,7 +31,8 @@ const GLOW_PEAK = 0.2;
 
 interface ActiveAnimation {
   anim: RollAnimation;
-  start: number;
+  /** Set on the first rendered frame, so a stall before it (shader compile, slow device) can't eat the tumble. */
+  start: number | null;
   settlingSent: boolean;
 }
 
@@ -158,11 +159,10 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
           plan = planProcedural(roll.faces, dimsNow, visualRandom);
         }
         const anim = new RollAnimation(roll.id, plan, restRef.current!, reducedRef.current);
-        animRef.current = { anim, start: performance.now(), settlingSent: false };
+        animRef.current = { anim, start: null, settlingSent: false };
         glowStartRef.current = null;
         resources.setGlow(0);
         updateRings();
-        if (!reducedRef.current) soundEngine.playRoll(plan.impacts, anim.throwStart, true);
         invalidate();
       } catch (error) {
         // Last resort: show the already-recorded result immediately and release the UI.
@@ -190,6 +190,11 @@ export function DiceSet({ dims, reducedMotion }: { dims: TrayDims; reducedMotion
       const now = performance.now();
       const active = animRef.current;
       if (active) {
+        if (active.start === null) {
+          active.start = now;
+          // Scheduled from the same instant as the visuals so impacts line up.
+          if (!active.anim.reduced) soundEngine.playRoll(active.anim.plan.impacts, active.anim.throwStart, true);
+        }
         const t = (now - active.start) / 1000;
         const { scale, done } = active.anim.sample(t, scratch.positions, scratch.quaternions);
         applyPoses(scratch.positions, scratch.quaternions, scale);

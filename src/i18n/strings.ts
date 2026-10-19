@@ -3,7 +3,7 @@ import { SYMBOLS, type SymbolId } from '../game/symbols';
 
 const en = {
   title: 'Langur Burja',
-  subtitle: 'Jhandi Burja · six-dice simulator',
+  subtitle: 'Jhandi Burja dice',
   roll: 'Roll Dice',
   rollOther: 'पासा फाल्नुहोस्',
   rolling: 'Rolling…',
@@ -49,7 +49,7 @@ type Strings = { [K in keyof typeof en]: (typeof en)[K] extends (n: number) => s
 
 const ne: Strings = {
   title: 'लङ्गुर बुर्जा',
-  subtitle: 'झण्डी बुर्जा · छ पासा खेल',
+  subtitle: 'झण्डी बुर्जा पासा',
   roll: 'पासा फाल्नुहोस्',
   rollOther: 'Roll Dice',
   rolling: 'पासा घुम्दै…',
