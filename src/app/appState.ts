@@ -45,6 +45,13 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
   (window as unknown as { __sound?: typeof soundEngine }).__sound = soundEngine;
 }
 
+// A hidden page needs no audio device; the next Roll gesture resumes it.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) soundEngine.suspendSoon(0);
+  });
+}
+
 // Keep history in sync when another tab of the app rolls or clears.
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (event) => {

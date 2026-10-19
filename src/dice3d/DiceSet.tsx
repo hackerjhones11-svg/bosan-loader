@@ -194,7 +194,7 @@ export function DiceSet({
       const counts = countFaces(faces);
       revealRef.current = {
         start: now,
-        level: faces.map((f) => (counts[f] >= 2 ? Math.min(0.85, 0.5 + 0.12 * (counts[f] - 2)) : 0)),
+        level: faces.map((f) => (counts[f] >= 2 ? Math.min(1, 0.78 + 0.08 * (counts[f] - 2)) : 0)),
         chimed: false,
       };
     };

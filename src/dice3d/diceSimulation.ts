@@ -91,8 +91,6 @@ const CONTROL = {
   shakeSteerGap: 0.45,
   /** After the shake, a die still on a wrong face with no plan for this long is rolled home. */
   stallHold: 0.12,
-  /** A moving die with no plan this close to recoverFrom is rolled home straight away. */
-  lateRollLead: 0.4,
   /** Typical time from starting a tumble to landing (plans must finish before recovery). */
   tumbleTime: 0.26,
   /** A steered tumble is judged again once it has landed, or after this long. */
@@ -132,6 +130,8 @@ export interface SimulationStats {
   scriptedRecoveries: number;
   /** Times the absolute bound had to end a roll outright (expected 0). */
   forced: number;
+  /** Tumbles or recovery rolls started by a die lying still after the shake (kept rare). */
+  startsFromRest: number;
 }
 
 type DieStatus = 'free' | 'tumbling' | 'caught' | 'scripted';
@@ -146,7 +146,8 @@ interface Scripted {
   /** Total rotation (rad) and its axis, for the rolling profile and the final rock. */
   angle: number;
   axis: Vector3;
-  startMargin: number;
+  /** Edges already rolled over (each one lands the die on a new face: an audible tap). */
+  edgesPassed: number;
 }
 
 interface DieControl {
@@ -205,6 +206,21 @@ const QUARTER_PROFILE = (() => {
   return { theta, time, duration: time[n] };
 })();
 
+/** Shortest horizontal distance between segments a0→a1 and b0→b1. */
+function segmentDistance(a0: Vector3, a1: Vector3, b0: Vector3, b1: Vector3): number {
+  let best = Infinity;
+  for (let k = 0; k <= 16; k++) {
+    const f = k / 16;
+    const ax = a0.x + (a1.x - a0.x) * f;
+    const az = a0.z + (a1.z - a0.z) * f;
+    for (let m = 0; m <= 16; m++) {
+      const g = m / 16;
+      best = Math.min(best, Math.hypot(ax - (b0.x + (b1.x - b0.x) * g), az - (b0.z + (b1.z - b0.z) * g)));
+    }
+  }
+  return best;
+}
+
 /** Angle reached `elapsed` seconds into a quarter roll. */
 function quarterAngle(elapsed: number): number {
   const { theta, time, duration } = QUARTER_PROFILE;
@@ -217,8 +233,6 @@ function quarterAngle(elapsed: number): number {
 
 /** Hull vertices of a die, for exact ground contact during scripted moves. */
 const HULL = createDieShape().vertices.map((v) => new Vector3(v.x, v.y, v.z));
-/** Largest distance from a die's centre to its hull: the radius it sweeps when turning. */
-const SWEEP_MARGIN = Math.max(...HULL.map((v) => v.length())) + 0.01;
 const SIDE_AXES = [
   new Vector3(1, 0, 0),
   new Vector3(-1, 0, 0),
@@ -237,7 +251,7 @@ export class DiceSimulation {
   readonly shake: Shake;
   readonly timing: typeof ROLL_TIMING;
   readonly step = PHYSICS.step;
-  readonly stats: SimulationStats = { steeredTumbles: 0, caught: 0, nudges: 0, scriptedRecoveries: 0, forced: 0 };
+  readonly stats: SimulationStats = { steeredTumbles: 0, caught: 0, nudges: 0, scriptedRecoveries: 0, forced: 0, startsFromRest: 0 };
   /** Every collision worth hearing, in time order. */
   readonly impacts: ImpactEvent[] = [];
 
@@ -396,7 +410,10 @@ export class DiceSimulation {
       track[o + 5] = b.quaternion.z;
       track[o + 6] = b.quaternion.w;
       const speed = b.velocity.length();
-      agitation += speed + b.angularVelocity.length() * 0.35;
+      // A scripted (kinematic) roll has no angular velocity of its own: use its rate.
+      const scripted = this.control?.[i]?.scripted;
+      const spin = scripted ? scripted.angle / scripted.duration : b.angularVelocity.length();
+      agitation += speed + spin * 0.35;
       if (b.position.y < DIE_HALF + 0.12) sliding += Math.hypot(b.velocity.x, b.velocity.z);
     });
     this.agitation[k] = Math.min(1, agitation / 60);
@@ -803,10 +820,12 @@ export class DiceSimulation {
         this.beginScripted(i, 'stalled');
         return;
       }
-      // Too late for the tumbles it needs and still moving: roll it home now,
-      // as part of its motion, rather than later from a standstill.
-      const moving = body.velocity.length() > 0.4 || body.angularVelocity.length() > 0.8;
-      if (moving && this.time >= this.timing.recoverFrom - CONTROL.lateRollLead && this.targetNormal(i).y < 0.9) {
+      // After the shake, a die landing on a wrong face with no tumbles that
+      // fit takes its final roll now, as part of its motion, instead of
+      // coming to rest first and setting off later.
+      const moving = body.velocity.length() > 0.3 || body.angularVelocity.length() > 0.6;
+      const afterShake = this.time >= this.timing.shakeEnd + this.timing.shakeFade;
+      if (moving && afterShake && this.targetNormal(i).y < 0.9) {
         this.beginScripted(i, 'no-plan-moving');
         return;
       }
@@ -822,6 +841,13 @@ export class DiceSimulation {
     const minSpin = Math.sqrt((2 * PHYSICS.gravity * DIE_HALF * (Math.SQRT2 - 1)) / (2 / 3));
     const spin = minSpin * (CONTROL.tumbleMargin + (this.random() - 0.5) * 2 * CONTROL.tumbleJitter);
     const dir = plan.dir;
+    if (
+      this.time >= this.timing.shakeEnd + this.timing.shakeFade &&
+      body.velocity.length() < 0.3 &&
+      body.angularVelocity.length() < 0.6
+    ) {
+      this.stats.startsFromRest += 1;
+    }
     // Tipping toward `dir` is a rotation about up × dir.
     const axis = new Vector3().crossVectors(UP, dir);
     body.angularVelocity.set(axis.x * spin, body.angularVelocity.y * 0.25, axis.z * spin);
@@ -868,27 +894,73 @@ export class DiceSimulation {
 
   /**
    * Bounded last resort: roll the die onto the recorded face along a scripted
-   * path, as if it tipped over its edge(s) once more. The centre follows the
-   * felt exactly (height from the hull's lowest vertex), keeps its corners
-   * clear of the walls, and the body is kinematic for the move so it shoves
-   * neighbours aside instead of passing through them.
+   * path that behaves like a real tip. A die lying flat pivots on the actual
+   * edge under one of its own sides, a quarter turn per die-width travelled
+   * (one roll for a side face, two in the same direction for the face
+   * underneath), its lowest corner staying on the felt. Only a cocked or
+   * stacked die takes the shortest rotation instead. The body is kinematic
+   * for the move, so it still shoves neighbours aside; it waits (returns
+   * false) rather than cross the path of another die already recovering,
+   * because two kinematic bodies do not collide with each other.
    */
-  private beginScripted(i: number, reason = 'forced'): void {
+  private beginScripted(i: number, reason = 'forced', force = false): boolean {
     const body = this.bodies[i];
     const c = this.control[i];
     const fromQ = this.bodyQuat(i, new Quaternion()).clone();
     const fromP = new Vector3(body.position.x, body.position.y, body.position.z);
     const n = this.targetNormal(i, new Vector3()).normalize();
-    const toQ = new Quaternion().setFromUnitVectors(n, UP).multiply(fromQ);
-    const angle = Math.acos(Math.min(1, Math.max(-1, n.y)));
-    // Rolling over k edges carries the centre k die-widths away from the face that comes up.
-    const away = new Vector3(-n.x, 0, -n.z);
-    if (away.lengthSq() < 1e-4) away.set(this.random() - 0.5, 0, this.random() - 0.5);
-    away.normalize().multiplyScalar(angle / (Math.PI / 2));
-    const toP = this.freeSpot(i, new Vector3(fromP.x + away.x, DIE_HALF, fromP.z + away.z), SWEEP_MARGIN);
-    const { halfWidth, halfDepth } = this.dims;
+    const flat = upwardFace(fromQ).alignment > 0.97 && fromP.y < CONTROL.onFeltHeight;
+
+    let toQ: Quaternion;
+    let toP: Vector3;
+    let angle: number;
+    let axis: Vector3;
+    const sides = SIDE_AXES.map((a) => a.clone().applyQuaternion(fromQ)).filter((w) => Math.abs(w.y) < 0.4);
+    if (flat && sides.length === 4 && n.y < 0.97) {
+      const dirs = sides.map((w) => w.setY(0).normalize());
+      let dir: Vector3;
+      let quarters: number;
+      if (n.y > -0.5) {
+        // Side face: tip toward the opposite side, which brings it up.
+        const want = new Vector3(-n.x, 0, -n.z).normalize();
+        dir = dirs.reduce((a, b) => (b.dot(want) > a.dot(want) ? b : a));
+        quarters = 1;
+      } else {
+        // Face underneath: two rolls the same way, toward the most open side.
+        dir = dirs.reduce((a, b) => (this.roomAt(i, fromP, b, 2) > this.roomAt(i, fromP, a, 2) ? b : a));
+        quarters = 2;
+      }
+      axis = new Vector3().crossVectors(UP, dir).normalize();
+      angle = quarters * (Math.PI / 2);
+      toQ = new Quaternion().setFromAxisAngle(axis, angle).multiply(fromQ);
+      toP = new Vector3(fromP.x + dir.x * quarters, DIE_HALF, fromP.z + dir.z * quarters);
+      if (!this.spotFree(i, toP, toQ)) toP = this.freeSpot(i, toP, toQ);
+    } else {
+      toQ = new Quaternion().setFromUnitVectors(n, UP).multiply(fromQ);
+      angle = Math.acos(Math.min(1, Math.max(-1, n.y)));
+      const along = new Vector3(-n.x, 0, -n.z);
+      if (along.lengthSq() > 1e-4) along.normalize().multiplyScalar(angle / (Math.PI / 2));
+      axis = new Vector3().crossVectors(n, UP);
+      axis = axis.lengthSq() > 1e-6 ? axis.normalize() : new Vector3(1, 0, 0);
+      toP = this.freeSpot(i, new Vector3(fromP.x + along.x, DIE_HALF, fromP.z + along.z), toQ);
+    }
+    // End exactly face-up, whatever residual tilt the die started with.
+    const residual = this.targetNormals[i].clone().applyQuaternion(toQ).normalize();
+    toQ.premultiply(new Quaternion().setFromUnitVectors(residual, UP));
+    this.containWithinWalls(toP, toQ);
+
+    if (!force) {
+      for (let j = 0; j < 6; j++) {
+        const other = this.control[j].scripted;
+        if (j === i || !other) continue;
+        const pos = this.bodies[j].position;
+        if (segmentDistance(fromP, toP, new Vector3(pos.x, 0, pos.z), other.toP) < 1.2) return false;
+      }
+    }
+
     const quarters = angle / (Math.PI / 2);
-    const rollAxis = new Vector3().crossVectors(n, UP);
+    const startedAtRest = body.velocity.length() < 0.3 && body.angularVelocity.length() < 0.6;
+    if (this.time >= this.timing.shakeEnd + this.timing.shakeFade && startedAtRest) this.stats.startsFromRest += 1;
     c.scripted = {
       start: this.time,
       duration:
@@ -900,8 +972,8 @@ export class DiceSimulation {
       toQ,
       toP,
       angle,
-      axis: rollAxis.lengthSq() > 1e-6 ? rollAxis.normalize() : new Vector3(1, 0, 0),
-      startMargin: Math.min(halfWidth - Math.abs(fromP.x), halfDepth - Math.abs(fromP.z)),
+      axis,
+      edgesPassed: 0,
     };
     c.status = 'scripted';
     this.onControl?.({ t: this.time, die: i, kind: 'scripted', detail: `${reason} angle ${angle.toFixed(2)} tumbles ${c.tumbles} nudges ${c.nudges}` });
@@ -909,30 +981,72 @@ export class DiceSimulation {
     body.angularDamping = PHYSICS.angularDamping;
     body.linearDamping = PHYSICS.linearDamping;
     this.stats.scriptedRecoveries += 1;
+    return true;
+  }
+
+  /** Hull extent of a die with orientation q along ±X and ±Z. */
+  private extents(q: Quaternion): { px: number; nx: number; pz: number; nz: number } {
+    let px = 0;
+    let nx = 0;
+    let pz = 0;
+    let nz = 0;
+    for (const v of HULL) {
+      tmpV.copy(v).applyQuaternion(q);
+      px = Math.max(px, tmpV.x);
+      nx = Math.max(nx, -tmpV.x);
+      pz = Math.max(pz, tmpV.z);
+      nz = Math.max(nz, -tmpV.z);
+    }
+    return { px, nx, pz, nz };
+  }
+
+  /** Moves a centre so a die with orientation q fits between the walls (no corner in the rim). */
+  private containWithinWalls(p: Vector3, q: Quaternion): void {
+    const e = this.extents(q);
+    const { halfWidth, halfDepth } = this.dims;
+    p.x = Math.max(-halfWidth + e.nx, Math.min(halfWidth - e.px, p.x));
+    p.z = Math.max(-halfDepth + e.nz, Math.min(halfDepth - e.pz, p.z));
+  }
+
+  /** Positions other dice occupy now, or will once their own recovery ends. */
+  private occupied(i: number): { x: number; z: number }[] {
+    const out: { x: number; z: number }[] = [];
+    this.bodies.forEach((other, j) => {
+      if (j === i) return;
+      out.push({ x: other.position.x, z: other.position.z });
+      const dest = this.control[j].scripted?.toP;
+      if (dest) out.push({ x: dest.x, z: dest.z });
+    });
+    return out;
+  }
+
+  private spotFree(i: number, p: Vector3, q: Quaternion): boolean {
+    const contained = p.clone();
+    this.containWithinWalls(contained, q);
+    if (contained.distanceTo(p) > 1e-6) return false;
+    return this.occupied(i).every((o) => Math.hypot(o.x - p.x, o.z - p.z) >= 1.2);
+  }
+
+  /** Free distance (capped) around the spot `steps` die-widths along `dir`. */
+  private roomAt(i: number, from: Vector3, dir: Vector3, steps: number): number {
+    const x = from.x + dir.x * steps;
+    const z = from.z + dir.z * steps;
+    const { halfWidth, halfDepth } = this.dims;
+    const wall = Math.min(halfWidth - Math.abs(x), halfDepth - Math.abs(z)) - DIE_HALF;
+    const dice = Math.min(...this.occupied(i).map((o) => Math.hypot(o.x - x, o.z - z) - 1.1));
+    return Math.min(wall, dice, 3);
   }
 
   /**
    * Nearest spot to `want` on the felt that no other die occupies, nor will
-   * occupy once its own recovery move ends (two kinematic dice do not collide
-   * with each other, so their destinations must not coincide).
+   * occupy once its own recovery move ends, with the die (orientation q)
+   * fully inside the walls.
    */
-  private freeSpot(i: number, want: Vector3, wallMargin: number): Vector3 {
+  private freeSpot(i: number, want: Vector3, q: Quaternion): Vector3 {
     const p = want.clone();
-    const limX = this.dims.halfWidth - wallMargin;
-    const limZ = this.dims.halfDepth - wallMargin;
-    const clamp = () => {
-      p.x = Math.max(-limX, Math.min(limX, p.x));
-      p.z = Math.max(-limZ, Math.min(limZ, p.z));
-    };
-    const others: { x: number; z: number }[] = [];
-    this.bodies.forEach((other, j) => {
-      if (j === i) return;
-      others.push({ x: other.position.x, z: other.position.z });
-      const dest = this.control[j].scripted?.toP;
-      if (dest) others.push({ x: dest.x, z: dest.z });
-    });
+    const others = this.occupied(i);
     for (let iteration = 0; iteration < 40; iteration++) {
-      clamp();
+      this.containWithinWalls(p, q);
       let moved = false;
       for (const o of others) {
         const dx = p.x - o.x;
@@ -947,8 +1061,7 @@ export class DiceSimulation {
       }
       if (!moved) break;
     }
-    // The move's path is clamped to the same limits, so ending here never jumps.
-    clamp();
+    this.containWithinWalls(p, q);
     return p;
   }
 
@@ -987,18 +1100,24 @@ export class DiceSimulation {
       e = u * u * (3 - 2 * u);
     }
     if (u >= 1) e = 1;
+    // A scripted roll is heard like a physical one: a felt tap each time it
+    // comes down on a new face (the final landing is recorded below).
+    const edges = Math.floor((e * s.angle + 1e-6) / (Math.PI / 2));
+    const totalEdges = Math.round(s.angle / (Math.PI / 2));
+    if (edges > s.edgesPassed && edges < totalEdges) {
+      s.edgesPassed = edges;
+      this.recordImpact(i, 4.5, 'felt');
+    }
     const q = new Quaternion().slerpQuaternions(s.fromQ, s.toQ, e);
     const p = new Vector3().lerpVectors(s.fromP, s.toP, e);
-    // Keep rotating corners off the walls: the allowed margin grows from where
-    // the die started to the full sweep radius as it turns.
-    const margin = Math.min(SWEEP_MARGIN, s.startMargin + (SWEEP_MARGIN - s.startMargin) * Math.min(1, 3 * e));
-    p.x = Math.max(-(this.dims.halfWidth - margin), Math.min(this.dims.halfWidth - margin, p.x));
-    p.z = Math.max(-(this.dims.halfDepth - margin), Math.min(this.dims.halfDepth - margin, p.z));
-    // Rest the lowest corner on the felt (pivoting over an edge), plus a small lift.
+    // Keep every corner out of the rim (toP already satisfies this for toQ,
+    // so the path ends exactly there).
+    this.containWithinWalls(p, q);
+    // Pivot on the felt: the lowest corner touches it; a die lifted off a
+    // neighbour comes down along the way.
     let lowest = Infinity;
     for (const v of HULL) lowest = Math.min(lowest, tmpV.copy(v).applyQuaternion(q).y);
-    const ground = -lowest;
-    p.y = Math.max(ground, s.fromP.y + (DIE_HALF - s.fromP.y) * e) + Math.sin(Math.PI * e) * 0.12;
+    p.y = Math.max(-lowest, s.fromP.y + (DIE_HALF - s.fromP.y) * e);
     body.quaternion.set(q.x, q.y, q.z, q.w);
     body.angularVelocity.set(0, 0, 0);
     if (u < 1) {
@@ -1069,7 +1188,7 @@ export class DiceSimulation {
     this.stats.forced += 1;
     for (let i = 0; i < 6; i++) {
       const c = this.control[i];
-      if (!c.scripted && !this.dieAtRestOnTarget(i)) this.beginScripted(i);
+      if (!c.scripted && !this.dieAtRestOnTarget(i)) this.beginScripted(i, 'forced', true);
       const s = this.control[i].scripted;
       if (s) this.driveScripted(i, s.start + s.duration);
       const body = this.bodies[i];

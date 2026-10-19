@@ -113,7 +113,7 @@ export function createDiceResources(): DiceResources {
   const bodyGeometry = new RoundedBoxGeometry(DIE_SIZE, DIE_SIZE, DIE_SIZE, 4, VISUAL_CORNER_RADIUS);
   const faceGeometry = createFaceGeometry(cellPx);
   const shadowGeometry = new PlaneGeometry(1.7, 1.7).rotateX(-Math.PI / 2);
-  const haloGeometry = new PlaneGeometry(2.3, 2.3).rotateX(-Math.PI / 2);
+  const haloGeometry = new PlaneGeometry(2.5, 2.5).rotateX(-Math.PI / 2);
 
   return {
     bodyGeometry,

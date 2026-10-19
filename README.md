@@ -72,9 +72,11 @@ place, `src/game/rollTiming.ts` (`ROLL_TIMING`), shared by the 3D tray, the 2D f
      hitting a wall or a settling die, preferring directions that don't reverse a moving die. The die is
      then given exactly the spin a cube needs to roll over one edge;
    - a die that rests cocked against a wall or on another die gets a small shove;
-   - bounded recovery: a die still on a wrong face at `recoverFrom` rolls over its edge(s) along a scripted
-     path (kinematic, so it still pushes neighbours, with its lowest corner on the felt). By `hardStop` every
-     die is resolved, and an absolute bound ends the roll whatever happens.
+   - bounded recovery: a die that lands wrong with no feasible tumble, or is still on a wrong face at
+     `recoverFrom`, rolls over the edge(s) under its own sides along a scripted path: one die-width per
+     quarter turn, paced like a real tip-over, lowest corner on the felt, kept inside the walls and away from
+     other dice (kinematic, so it still pushes neighbours, and each edge makes a felt tap). By `hardStop`
+     every die is resolved, and an absolute bound ends the roll whatever happens.
    The rendered die is the physics body every frame, so its face never changes after it stops. The resting
    faces are checked against the record once more before the reveal.
 5. **Playback** (`DiceSet.tsx`) advances the simulation slightly ahead of the frame being drawn within a
@@ -191,16 +193,19 @@ the app keeps working in memory.
 - Sound is optional, starts only after a user gesture, and the mute preference persists.
 - Rendering is on demand (idle frames are free). Device pixel ratio is capped (2, or 1.75 on touch devices).
   Geometry, materials and the symbol atlas are shared by all dice and disposed on unmount. One 1024² shadow
-  map, no post-processing. Three.js and physics load in a lazy chunk; the initial bundle is ~82 kB gzip.
+  map, no post-processing. Three.js and physics load in a lazy chunk; the initial bundle is ~83 kB gzip.
 - Without WebGL, or if the 3D view fails or loses its context, a 2D card view takes over using the same engine.
 
 ## Known limitations
 
 - React Three Fiber 9 still constructs `THREE.Clock`, so three.js r18x logs a deprecation warning in the console.
-- The 3D chunk is ~275 kB gzip; R3F references the whole three.js namespace, so it cannot be tree-shaken further.
+- The 3D chunk is ~280 kB gzip; R3F references the whole three.js namespace, so it cannot be tree-shaken further.
 - Sounds are synthesised, so they are deliberately restrained rather than recorded dice.
 - Free physics does not always deliver the recorded face in time. In 100 simulated rolls per tray shape,
-  15–28% of rolls needed no help beyond steered tumbles; on average 1.3 (wide/square tray) to 1.75
-  (tall, phone-portrait tray) dice per roll take the bounded recovery roll. It starts at a landing or while
-  the die is still moving where possible, follows real tipping dynamics and pushes neighbours, so it reads
-  as a last tumble, but it is scripted rather than free physics and a careful viewer may notice it.
+  11–16% of rolls needed no help beyond steered tumbles; on average about 1.6 (wide tray) to 1.8 (square
+  and tall trays) dice per roll take the bounded recovery roll. About four in five of those start while the
+  die is still moving just after the shake, so they read as its last tumbles; roughly one die in five rolls
+  is seen to lie still on a wrong face briefly before rolling over. The recovery roll is scripted rather
+  than free physics, and a careful viewer may notice it.
+- Free-flying dice can overlap the rim or felt by up to ~0.1 die-width for a single 5 ms physics step during
+  the hardest hits of the shake (no continuous collision detection); this is not visible at normal speed.

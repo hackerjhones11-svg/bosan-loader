@@ -82,8 +82,8 @@ const TONES: Record<ImpactKind, Tone> = {
   },
 };
 
-class SoundEngine {
-  private ctx: AudioContext | null = null;
+export class SoundEngine {
+  private ctx: BaseAudioContext | null = null;
   private output: GainNode | null = null;
   private noise: AudioBuffer | null = null;
   private bus: GainNode | null = null;
@@ -94,45 +94,93 @@ class SoundEngine {
   private lastActivityAt = 0;
   /** Identifies the roll that currently owns the bus (see beginRoll/release). */
   private session = 0;
+  private suspendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Web Audio missing or failed to start: stay silent without retrying. */
+  private unavailable = false;
   /** Counters for verification and tuning (cheap; never affect playback). */
   readonly stats = { impacts: 0, grains: 0, dropped: 0, lastVoiceAt: 0, lastImpactAt: 0, rolls: 0, bedPeak: 0 };
   enabled = true;
 
   /** Call synchronously from a click/keydown handler so browsers allow playback. */
   unlock(): void {
-    if (!this.enabled) return;
+    if (!this.enabled || this.unavailable) return;
+    this.cancelSuspend();
+    let created: AudioContext | null = null;
     try {
       if (!this.ctx) {
-        const Ctor: typeof AudioContext | undefined =
-          globalThis.AudioContext ??
-          (globalThis as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-        if (!Ctor) return;
-        const ctx = new Ctor();
-        const compressor = ctx.createDynamicsCompressor();
-        compressor.threshold.value = -20;
-        compressor.knee.value = 14;
-        compressor.ratio.value = 4;
-        compressor.attack.value = 0.003;
-        compressor.release.value = 0.14;
-        const output = ctx.createGain();
-        output.gain.value = 0.62;
-        output.connect(compressor).connect(ctx.destination);
-        this.ctx = ctx;
-        this.output = output;
-        this.noise = this.makeNoise(ctx, 2.5);
+        if (typeof globalThis.AudioContext !== 'function') {
+          this.unavailable = true;
+          return;
+        }
+        created = new AudioContext();
+        this.attach(created);
       }
-      if (this.ctx.state === 'suspended') void this.ctx.resume().catch(() => {});
+      const live = this.ctx as AudioContext;
+      if (live.state === 'suspended' && typeof live.resume === 'function') void live.resume().catch(() => {});
     } catch {
+      // Never leak a half-built context or retry on every gesture.
+      void created?.close().catch(() => {});
       this.ctx = null;
+      this.unavailable = true;
     }
+  }
+
+  /**
+   * Lets the audio device sleep once nothing is playing (battery on phones).
+   * The next Roll gesture resumes it through unlock().
+   */
+  suspendSoon(delayMs = 1500): void {
+    this.cancelSuspend();
+    if (this.virtualTime !== null) return;
+    this.suspendTimer = setTimeout(() => {
+      this.suspendTimer = null;
+      const live = this.ctx as AudioContext | null;
+      if (live && live.state === 'running' && typeof live.suspend === 'function') void live.suspend().catch(() => {});
+    }, delayMs);
+  }
+
+  private cancelSuspend(): void {
+    if (this.suspendTimer !== null) clearTimeout(this.suspendTimer);
+    this.suspendTimer = null;
+  }
+
+  /**
+   * Wires the output chain onto a context. unlock() uses a live AudioContext;
+   * tests attach an OfflineAudioContext (with `virtualTime`) to render and
+   * measure a roll's soundtrack.
+   */
+  attach(ctx: BaseAudioContext): void {
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -20;
+    compressor.knee.value = 14;
+    compressor.ratio.value = 4;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.14;
+    const output = ctx.createGain();
+    output.gain.value = 0.62;
+    output.connect(compressor);
+    compressor.connect(ctx.destination);
+    this.ctx = ctx;
+    this.output = output;
+    this.noise = this.makeNoise(ctx, 2.5);
+  }
+
+  /** Test hook: when set, used as "now" instead of the context clock (for offline rendering). */
+  virtualTime: number | null = null;
+
+  private clock(): number {
+    return this.virtualTime ?? this.ctx!.currentTime;
   }
 
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
-    if (!enabled) this.stopAll();
+    if (!enabled) {
+      this.stopAll();
+      this.suspendSoon(200);
+    }
   }
 
-  private makeNoise(ctx: AudioContext, seconds: number): AudioBuffer {
+  private makeNoise(ctx: BaseAudioContext, seconds: number): AudioBuffer {
     const length = Math.floor(ctx.sampleRate * seconds);
     const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
     const data = buffer.getChannelData(0);
@@ -140,7 +188,7 @@ class SoundEngine {
     return buffer;
   }
 
-  private live(): { ctx: AudioContext; bus: GainNode; noise: AudioBuffer } | null {
+  private live(): { ctx: BaseAudioContext; bus: GainNode; noise: AudioBuffer } | null {
     if (!this.enabled || !this.ctx || !this.output || !this.noise || this.ctx.state === 'closed') return null;
     if (!this.bus) {
       this.bus = this.ctx.createGain();
@@ -162,7 +210,7 @@ class SoundEngine {
 
   /** Current audio clock (s), or null before audio has been unlocked. */
   now(): number | null {
-    return this.ctx ? this.ctx.currentTime : null;
+    return this.ctx ? this.clock() : null;
   }
 
   /** Whether the continuous slide/rattle texture is currently running. */
@@ -222,6 +270,7 @@ class SoundEngine {
    */
   beginRoll(): number {
     this.stopAll();
+    this.cancelSuspend();
     this.session += 1;
     const token = this.session;
     this.lastByKey.clear();
@@ -242,7 +291,7 @@ class SoundEngine {
       const gain = ctx.createGain();
       gain.gain.value = 0;
       source.connect(filter).connect(gain).connect(bus);
-      source.start(ctx.currentTime, visualRandom() * noise.duration);
+      source.start(this.clock(), visualRandom() * noise.duration);
       this.bed = { source, gain, filter };
     } catch {
       this.bed = null;
@@ -262,7 +311,7 @@ class SoundEngine {
   impact(delay: number, strength: number, surface: ImpactKind, die: number): void {
     try {
       if (!this.live() || strength < MIN_STRENGTH[surface]) return;
-      const at = this.ctx!.currentTime + Math.max(0, delay) + 0.004;
+      const at = this.clock() + Math.max(0, delay) + 0.004;
       const key = `${die}:${surface}`;
       if (at - (this.lastByKey.get(key) ?? -1) < PER_DIE_GAP) {
         this.stats.dropped += 1;
@@ -287,7 +336,7 @@ class SoundEngine {
     try {
       const r = this.live();
       if (!r) return;
-      const now = r.ctx.currentTime;
+      const now = this.clock();
       const dt = this.lastActivityAt ? Math.min(0.1, now - this.lastActivityAt) : 0;
       this.lastActivityAt = now;
       if (this.bed) {
@@ -313,7 +362,7 @@ class SoundEngine {
   endRoll(): void {
     try {
       if (this.ctx && this.bed) {
-        const now = this.ctx.currentTime;
+        const now = this.clock();
         this.bed.gain.gain.cancelScheduledValues(now);
         this.bed.gain.gain.setTargetAtTime(0, now, 0.05);
         const bed = this.bed;
@@ -324,6 +373,7 @@ class SoundEngine {
     }
     this.bed = null;
     this.grainDebt = 0;
+    this.suspendSoon(2000);
   }
 
   /** A soft, low wooden tone as the result is revealed. */
@@ -332,7 +382,7 @@ class SoundEngine {
       const r = this.live();
       if (!r) return;
       const { ctx, bus } = r;
-      const t = ctx.currentTime + 0.01;
+      const t = this.clock() + 0.01;
       for (const [freq, delay, gain] of [
         [523.25, 0, 0.05],
         [784, 0.09, 0.035],
@@ -364,7 +414,7 @@ class SoundEngine {
     try {
       if (this.bus && this.ctx) {
         const old = this.bus;
-        const now = this.ctx.currentTime;
+        const now = this.clock();
         old.gain.cancelScheduledValues(now);
         old.gain.setValueAtTime(old.gain.value, now);
         old.gain.linearRampToValueAtTime(0, now + 0.03);
