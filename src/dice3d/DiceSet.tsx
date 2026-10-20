@@ -436,9 +436,7 @@ export function DiceSet({
         if (live.sim) {
           const sim = live.sim;
           const look = live.lookAhead;
-          if (look && !look.decided && (look.finished || t >= ROLL_TIMING.branchAt - DECIDE_AHEAD)) {
-            decide(live, !look.finished ? 'deadline' : look.best ? 'search' : 'fallback');
-          }
+          if (look && !look.decided && look.finished) decide(live, look.best ? 'search' : 'fallback');
           // Never past the branch point before a continuation is chosen.
           const target = look && !look.decided ? Math.min(t + LEAD, ROLL_TIMING.branchAt) : t + LEAD;
           sim.advanceTo(target, now + PHYSICS_BUDGET_MS);
@@ -452,6 +450,9 @@ export function DiceSet({
             live.start += (t - sim.time) * 1000 * SLOWMO;
             t = sim.time;
           }
+          // Playback itself (not the raw clock, which one long frame can push far
+          // ahead) is about to reach the branch point: take the best found so far.
+          if (look && !look.decided && t >= ROLL_TIMING.branchAt - DECIDE_AHEAD) decide(live, 'deadline');
           const shown = sim.done ? Math.min(t, sim.restAt!) : t;
           if (import.meta.env.DEV) window.__playT = shown;
           for (let i = 0; i < 6; i++) sim.sample(i, shown, P[i], Q[i]);
