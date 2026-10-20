@@ -43,7 +43,26 @@ export interface Shake {
   offset(t: number, out: Vec3Like): Vec3Like;
   /** 0..1 shake strength at time t (for audio and diagnostics). */
   envelope(t: number): number;
+  /**
+   * From t0 on, the hands carry on differently: the stroke axis, strength and
+   * cross-stroke phase drift to new values and the jolts still to come are
+   * re-drawn. Everything before t0 is unchanged and nothing jumps at t0, so
+   * any number of continuations can be tried from the same moment. Calling it
+   * again replaces the previous continuation; `null` restores the original.
+   */
+  diverge(t0: number, random: VisualRandom | null): void;
 }
+
+interface Divergence {
+  t0: number;
+  axisShift: number;
+  ampScale: number;
+  phaseShift: number;
+  jolts: Jolt[];
+}
+
+/** How long a continuation takes to blend from the original shake into its own. */
+const DIVERGE_BLEND = 0.35;
 
 export interface ShakeOptions {
   gravity: number;
@@ -76,21 +95,25 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
   const wanderPhase = random() * Math.PI * 2;
   const drift = (random() - 0.5) * 0.25;
 
+  const drawJolt = (t: number, r: VisualRandom): Jolt => {
+    const angle = r() * Math.PI * 2;
+    const mag = g * (1.0 + r() * 0.8);
+    return {
+      t,
+      width: 0.06 + r() * 0.05,
+      x: Math.cos(angle) * mag,
+      z: Math.sin(angle) * mag,
+      y: g * (0.7 + r() * 0.5),
+    };
+  };
+  const joltsUntil = timing.shakeEnd - 0.35;
   const jolts: Jolt[] = [];
   const joltCount = 4 + Math.floor(random() * 3);
   for (let i = 0; i < joltCount; i++) {
-    const span = timing.shakeEnd - 0.35 - timing.buildUp;
-    const t = timing.buildUp + ((i + 0.2 + random() * 0.6) / joltCount) * span;
-    const angle = random() * Math.PI * 2;
-    const mag = g * (1.0 + random() * 0.8);
-    jolts.push({
-      t,
-      width: 0.06 + random() * 0.05,
-      x: Math.cos(angle) * mag,
-      z: Math.sin(angle) * mag,
-      y: g * (0.7 + random() * 0.5),
-    });
+    const span = joltsUntil - timing.buildUp;
+    jolts.push(drawJolt(timing.buildUp + ((i + 0.2 + random() * 0.6) / joltCount) * span, random));
   }
+  let branch: Divergence | null = null;
 
   const envelope = (t: number): number => {
     if (t <= 0) return 0;
@@ -100,15 +123,24 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
   };
 
   const stroke = (t: number) => {
-    const theta = axis0 + drift * t + 0.38 * Math.sin(2 * Math.PI * 0.21 * t + wanderPhase);
+    const blend = branch && t > branch.t0 ? smooth((t - branch.t0) / DIVERGE_BLEND) : 0;
+    let theta = axis0 + drift * t + 0.38 * Math.sin(2 * Math.PI * 0.21 * t + wanderPhase);
     const swell = 1 + 0.22 * Math.sin(2 * Math.PI * 0.47 * t + swellPhase);
-    const amp = strength * g * swell * envelope(t);
+    let amp = strength * g * swell * envelope(t);
+    let crossPhase = phase1;
+    if (branch && blend > 0) {
+      theta += branch.axisShift * blend;
+      amp *= 1 + (branch.ampScale - 1) * blend;
+      crossPhase += branch.phaseShift * blend;
+    }
     const w0 = 2 * Math.PI * f0;
     const w1 = 2 * Math.PI * f1;
     const c0 = Math.cos(w0 * t + phase0);
-    const c1 = Math.cos(w1 * t + phase1);
+    const c1 = Math.cos(w1 * t + crossPhase);
     return { theta, amp, w0, w1, c0, c1 };
   };
+  /** Jolts in effect: the original ones, with those after a divergence point re-drawn. */
+  const activeJolts = (t: number): readonly Jolt[] => (branch && t > branch.t0 ? branch.jolts : jolts);
 
   return {
     envelope,
@@ -119,7 +151,7 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
       out.x = amp * (c0 * ax - crossRatio * c1 * az);
       out.z = amp * (c0 * az + crossRatio * c1 * ax);
       out.y = 0;
-      for (const j of jolts) {
+      for (const j of activeJolts(t)) {
         const u = (t - j.t) / j.width;
         if (u < 0 || u > 1) continue;
         const env = envelope(t);
@@ -143,6 +175,28 @@ export function createShake(dims: TrayDims, random: VisualRandom, options: Shake
       out.z = visualScale * (d0 * az + d1 * ax);
       out.y = 0;
       return out;
+    },
+    diverge(t0, r) {
+      if (!r) {
+        branch = null;
+        return;
+      }
+      // Jolts already under way at t0 carry on; the ones still to come are re-drawn.
+      const kept = jolts.filter((j) => j.t <= t0);
+      const remaining = jolts.length - kept.length;
+      const fresh: Jolt[] = [];
+      const from = t0 + 0.08;
+      const count = Math.max(0, remaining + Math.floor(r() * 3) - 1);
+      if (joltsUntil > from) {
+        for (let i = 0; i < count; i++) fresh.push(drawJolt(from + ((i + 0.15 + r() * 0.7) / count) * (joltsUntil - from), r));
+      }
+      branch = {
+        t0,
+        axisShift: (r() - 0.5) * 1.2,
+        ampScale: 0.9 + r() * 0.22,
+        phaseShift: (r() - 0.5) * 2 * Math.PI,
+        jolts: [...kept, ...fresh],
+      };
     },
   };
 }

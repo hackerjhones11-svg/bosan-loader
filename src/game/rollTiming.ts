@@ -15,6 +15,13 @@ export const ROLL_TIMING = {
   shakeFade: 0.3,
   /** From here each die's last tumbles may be shaped toward its recorded face. */
   steerFrom: 1.5,
+  /**
+   * Look-ahead point: several ways the hands could carry on shaking from here
+   * are simulated in the background, and the one whose dice need the least
+   * help reaching their recorded faces is played. Playback reaches this
+   * moment only after the choice is made, so nothing on screen changes.
+   */
+  branchAt: 2.2,
   /** From here extra resistance helps any straggler skid to a stop. */
   settleAssistFrom: 4.6,
   /** A die still not on its recorded face here gets the bounded recovery move. */

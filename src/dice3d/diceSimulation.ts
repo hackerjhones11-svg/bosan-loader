@@ -6,7 +6,7 @@ import { createDieShape } from './dieCollider';
 import { FACE_LAYOUT, upwardFace } from './faceMap';
 import { createShake, type Shake } from './shake';
 import { DIE_HALF, type TrayDims } from './trayConfig';
-import { visualRandom, type VisualRandom } from './visualRandom';
+import { seededVisualRandom, visualRandom, type VisualRandom } from './visualRandom';
 
 /**
  * Live physics for one roll of six dice in a shaken tray.
@@ -18,8 +18,9 @@ import { visualRandom, type VisualRandom } from './visualRandom';
  * The outcome is decided before this runs (crypto, in the store). Dice start
  * where they rest, showing the previous result, so the physical trajectory
  * itself must finish on the recorded faces; nothing is relabelled or swapped.
- * That is the job of the final-settling controller, active only after the
- * shake stops (ROLL_TIMING.steerFrom):
+ * That is the job of the settling controller, active from
+ * ROLL_TIMING.steerFrom (late in the shake, when the tray explains any
+ * tumble):
  *
  * - A die landing flat with its recorded face up while it is slowing down
  *   is "caught": most of its remaining spin is absorbed, as felt does, and
@@ -36,6 +37,12 @@ import { visualRandom, type VisualRandom } from './visualRandom';
  *   an unresolved die rolls over its edge(s) to the recorded face along a
  *   scripted but physically shaped path (pivoting over an edge, centre
  *   rising and falling), and by ROLL_TIMING.hardStop everything is resolved.
+ *
+ * Branch point (ROLL_TIMING.branchAt): how the hands carry on shaking from
+ * there is chosen by chooseBranch() before the run gets there (otherwise one
+ * is drawn). Together with snapshot()/restore() and score(), this lets
+ * branchSearch.ts try several continuations and play the one whose dice need
+ * the least help; runs with the same seed are bit-for-bit identical.
  *
  * Every step is recorded, so rendering interpolates samples at any frame
  * rate, and fast-forwarding (tab hidden, tests) uses exactly the same code.
@@ -132,6 +139,8 @@ export interface SimulationStats {
   forced: number;
   /** Tumbles or recovery rolls started by a die lying still after the shake (kept rare). */
   startsFromRest: number;
+  /** Of those, recovery rolls: the most noticeable intervention. */
+  scriptedFromRest: number;
 }
 
 type DieStatus = 'free' | 'tumbling' | 'caught' | 'scripted';
@@ -164,13 +173,18 @@ interface DieControl {
   /** Where the recorded face should be after the current tumble (1 up, 0 side, −1 down); diagnostics. */
   expectUp: number;
   nudgeAt: number;
-  lastImpact: number;
   cockedSince: number | null;
   restSteps: number;
   scripted: Scripted | null;
 }
 
 export interface SimulationOptions {
+  /**
+   * Seed for every visual choice (shake, launch spins, controller jitter). Two
+   * simulations built with the same seed, faces, tray and start are identical,
+   * which is what lets a background search try continuations of this one.
+   */
+  seed?: number;
   random?: VisualRandom;
   timing?: typeof ROLL_TIMING;
   /** Testing hook: disable the outcome controller to observe free physics. */
@@ -182,6 +196,37 @@ export interface SimulationOptions {
 const UP = new Vector3(0, 1, 0);
 /** Seconds past hardStop after which a roll is finished outright, whatever its state. */
 const ABSOLUTE_GRACE = 1.2;
+/** Rest outside this window makes a continuation less attractive (see score()). */
+const REST_WINDOW = { from: 4.6, to: 5.3 } as const;
+
+/** Plain-data state of a simulation at one moment, for trying continuations elsewhere (e.g. a worker). */
+export interface SimSnapshot {
+  time: number;
+  samples: number;
+  restSince: number | null;
+  stats: SimulationStats;
+  bodies: { p: number[]; q: number[]; v: number[]; w: number[]; kinematic: boolean; linearDamping: number; angularDamping: number }[];
+  control: ControlSnapshot[];
+  /** cannon-es contact bookkeeping (which pairs touched last step), so no contact is heard twice. */
+  contacts: number[];
+  contactsPrevious: number[];
+}
+
+/** Fingerprint of a simulation state, to confirm two runs reached the same branch point. */
+export function stateHash(snap: SimSnapshot): number {
+  const values = new Float64Array(snap.bodies.length * 13 + 1);
+  let k = 0;
+  values[k++] = snap.time;
+  for (const b of snap.bodies) for (const v of [b.p, b.q, b.v, b.w]) for (const x of v) values[k++] = x;
+  const words = new Uint32Array(values.buffer);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+  return h >>> 0;
+}
+
+type ControlSnapshot = Omit<DieControl, 'scripted'> & {
+  scripted: (Omit<Scripted, 'fromP' | 'fromQ' | 'toP' | 'toQ' | 'axis'> & Record<'fromP' | 'fromQ' | 'toP' | 'toQ' | 'axis', number[]>) | null;
+};
 
 /**
  * Timing of one quarter roll over an edge, from energy conservation for a
@@ -251,7 +296,15 @@ export class DiceSimulation {
   readonly shake: Shake;
   readonly timing: typeof ROLL_TIMING;
   readonly step = PHYSICS.step;
-  readonly stats: SimulationStats = { steeredTumbles: 0, caught: 0, nudges: 0, scriptedRecoveries: 0, forced: 0, startsFromRest: 0 };
+  readonly stats: SimulationStats = {
+    steeredTumbles: 0,
+    caught: 0,
+    nudges: 0,
+    scriptedRecoveries: 0,
+    forced: 0,
+    startsFromRest: 0,
+    scriptedFromRest: 0,
+  };
   /** Every collision worth hearing, in time order. */
   readonly impacts: ImpactEvent[] = [];
 
@@ -262,7 +315,8 @@ export class DiceSimulation {
   private readonly world: World;
   private readonly bodies: Body[];
   private readonly control: DieControl[];
-  private readonly random: VisualRandom;
+  /** Replaced at the branch point by the chosen continuation's own sequence. */
+  private random: VisualRandom;
   private readonly steering: boolean;
   private readonly onControl?: SimulationOptions['onControl'];
   private readonly maxSamples: number;
@@ -273,11 +327,16 @@ export class DiceSimulation {
   private restSince: number | null = null;
   private readonly accel = { x: 0, y: 0, z: 0 };
   private readonly targetNormals: Vector3[];
+  /** Continuation chosen for the branch point (null: not yet; one is drawn if the point is reached). */
+  private pendingBranch: number | null = null;
+  private branchSeed: number | null = null;
+  /** stateHash() of this run at the branch point (null until it gets there). */
+  branchPointHash: number | null = null;
 
   constructor(faces: Faces, dims: TrayDims, start: readonly DiePose[], options: SimulationOptions = {}) {
     this.faces = faces;
     this.dims = dims;
-    this.random = options.random ?? visualRandom;
+    this.random = options.seed !== undefined ? seededVisualRandom(options.seed) : (options.random ?? visualRandom);
     this.timing = options.timing ?? ROLL_TIMING;
     this.steering = options.steering ?? true;
     this.onControl = options.onControl;
@@ -336,8 +395,6 @@ export class DiceSimulation {
         const other = event.body;
         const j = this.bodies.indexOf(other);
         const strength = Math.abs(event.contact.getImpactVelocityAlongNormal());
-        this.control[i].lastImpact = this.time;
-        if (j !== -1) this.control[j].lastImpact = this.time;
         // Die-die contacts are reported to both bodies; record one.
         if (j !== -1 && j < i) return;
         if (strength < 0.5) return;
@@ -358,7 +415,6 @@ export class DiceSimulation {
       stalledSince: null,
       expectUp: 0,
       nudgeAt: -1,
-      lastImpact: -1,
       cockedSince: null,
       restSteps: 0,
       scripted: null,
@@ -387,6 +443,11 @@ export class DiceSimulation {
 
   get done(): boolean {
     return this.restAt !== null;
+  }
+
+  /** True once the run has passed the branch point on a chosen continuation. */
+  get branched(): boolean {
+    return this.branchSeed !== null;
   }
 
   /** Number of recorded samples (time of the last one is (count − 1)·step). */
@@ -440,6 +501,10 @@ export class DiceSimulation {
   /** Advances by one fixed step. */
   stepOnce(): void {
     if (this.done) return;
+    if (this.branchSeed === null && this.time >= this.timing.branchAt) {
+      this.branchPointHash = stateHash(this.snapshot());
+      this.applyBranch(this.pendingBranch ?? Math.floor(this.random() * 2 ** 32));
+    }
     const t = this.time;
     const shaking = t < this.timing.shakeEnd + this.timing.shakeFade;
     if (shaking) {
@@ -475,6 +540,127 @@ export class DiceSimulation {
       n += 1;
       if ((n & 7) === 0 && performance.now() > deadline) break;
     }
+  }
+
+  /**
+   * Chooses how the hands carry on at the branch point (see ROLL_TIMING.branchAt).
+   * Only possible before the run gets there; returns false afterwards.
+   */
+  chooseBranch(seed: number): boolean {
+    if (this.branchSeed !== null) return false;
+    this.pendingBranch = seed >>> 0;
+    return true;
+  }
+
+  private applyBranch(seed: number): void {
+    this.branchSeed = seed >>> 0;
+    this.shake.diverge(this.time, seededVisualRandom(this.branchSeed));
+    this.random = seededVisualRandom((this.branchSeed ^ 0x5bd1e995) >>> 0);
+  }
+
+  /**
+   * How much this run's dice needed visible help (lower is better): recovery
+   * rolls, above all ones started from rest, tumbles started from rest,
+   * nudges, and settling outside the intended window. Used to pick between
+   * continuations; never affects which faces come up.
+   */
+  score(): number {
+    const s = this.stats;
+    // Mid-run this is a lower bound of the final score (every term only grows),
+    // so a search can abandon a continuation as soon as it cannot win.
+    const late = Math.max(0, (this.restAt ?? this.time) - REST_WINDOW.to) * 40;
+    const early = this.restAt !== null ? Math.max(0, REST_WINDOW.from - this.restAt) * 20 : 0;
+    return (
+      s.forced * 1000 +
+      s.scriptedRecoveries * 10 +
+      s.scriptedFromRest * 30 +
+      (s.startsFromRest - s.scriptedFromRest) * 6 +
+      s.nudges * 2 +
+      late +
+      early
+    );
+  }
+
+  /** State at this moment, as plain data. Taken before the branch point, to try continuations from it. */
+  snapshot(): SimSnapshot {
+    if (this.branchSeed !== null) throw new Error('snapshot() after the branch point');
+    const arr = (v: { x: number; y: number; z: number; w?: number }) => (v.w === undefined ? [v.x, v.y, v.z] : [v.x, v.y, v.z, v.w]);
+    return {
+      time: this.time,
+      samples: this.samples,
+      restSince: this.restSince,
+      stats: { ...this.stats },
+      bodies: this.bodies.map((b) => ({
+        p: arr(b.position),
+        q: arr(b.quaternion),
+        v: arr(b.velocity),
+        w: arr(b.angularVelocity),
+        kinematic: b.type === Body.KINEMATIC,
+        linearDamping: b.linearDamping,
+        angularDamping: b.angularDamping,
+      })),
+      control: this.control.map((c) => ({
+        ...c,
+        scripted: c.scripted && {
+          ...c.scripted,
+          fromP: c.scripted.fromP.toArray(),
+          fromQ: c.scripted.fromQ.toArray(),
+          toP: c.scripted.toP.toArray(),
+          toQ: c.scripted.toQ.toArray(),
+          axis: c.scripted.axis.toArray(),
+        },
+      })),
+      contacts: [...this.world.collisionMatrix.matrix],
+      contactsPrevious: [...this.world.collisionMatrixPrevious.matrix],
+    };
+  }
+
+  /**
+   * Puts this simulation in the snapshotted state. It must have been built
+   * like the one snapshotted (same seed, faces, tray), so that its shake is
+   * the same; the continuation is then chosen again with chooseBranch().
+   */
+  restore(snap: SimSnapshot): void {
+    this.time = snap.time;
+    this.restSince = snap.restSince;
+    this.restAt = null;
+    Object.assign(this.stats, snap.stats);
+    for (let k = this.impacts.length - 1; k >= 0 && this.impacts[k].t > snap.time; k--) this.impacts.pop();
+    snap.bodies.forEach((s, i) => {
+      const b = this.bodies[i];
+      b.position.set(s.p[0], s.p[1], s.p[2]);
+      b.quaternion.set(s.q[0], s.q[1], s.q[2], s.q[3]);
+      b.velocity.set(s.v[0], s.v[1], s.v[2]);
+      b.angularVelocity.set(s.w[0], s.w[1], s.w[2]);
+      b.type = s.kinematic ? Body.KINEMATIC : Body.DYNAMIC;
+      b.linearDamping = s.linearDamping;
+      b.angularDamping = s.angularDamping;
+      b.force.set(0, 0, 0);
+      b.torque.set(0, 0, 0);
+      b.aabbNeedsUpdate = true;
+    });
+    snap.control.forEach((s, i) => {
+      const sc = s.scripted;
+      this.control[i] = {
+        ...s,
+        scripted: sc && {
+          ...sc,
+          fromP: new Vector3().fromArray(sc.fromP),
+          fromQ: new Quaternion().fromArray(sc.fromQ),
+          toP: new Vector3().fromArray(sc.toP),
+          toQ: new Quaternion().fromArray(sc.toQ),
+          axis: new Vector3().fromArray(sc.axis),
+        },
+      };
+    });
+    this.world.collisionMatrix.matrix = [...snap.contacts];
+    this.world.collisionMatrixPrevious.matrix = [...snap.contactsPrevious];
+    this.pendingBranch = null;
+    this.branchSeed = null;
+    this.shake.diverge(0, null);
+    // Re-record the current sample, so the track continues from this state.
+    this.samples = Math.max(0, Math.min(snap.samples, this.maxSamples) - 1);
+    this.record();
   }
 
   /** Fast-forwards to the end (always terminates: see ABSOLUTE_GRACE). */
@@ -960,7 +1146,10 @@ export class DiceSimulation {
 
     const quarters = angle / (Math.PI / 2);
     const startedAtRest = body.velocity.length() < 0.3 && body.angularVelocity.length() < 0.6;
-    if (this.time >= this.timing.shakeEnd + this.timing.shakeFade && startedAtRest) this.stats.startsFromRest += 1;
+    if (this.time >= this.timing.shakeEnd + this.timing.shakeFade && startedAtRest) {
+      this.stats.startsFromRest += 1;
+      this.stats.scriptedFromRest += 1;
+    }
     c.scripted = {
       start: this.time,
       duration:

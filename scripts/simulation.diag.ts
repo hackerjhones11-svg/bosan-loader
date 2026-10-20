@@ -1,5 +1,6 @@
 import { Quaternion, Vector3 } from 'three';
 import { test } from 'vitest';
+import { BranchSearch, branchCandidates, posesToPlain } from '../src/dice3d/branchSearch';
 import { createDieShape } from '../src/dice3d/dieCollider';
 import { DiceSimulation } from '../src/dice3d/diceSimulation';
 import { upwardFace } from '../src/dice3d/faceMap';
@@ -13,6 +14,8 @@ import type { Faces } from '../src/game/roll';
 // motion quality, outcome control and cost of the live dice simulation.
 const N = Number(process.env.DIAG_ROLLS ?? 40);
 const STEERING = process.env.DIAG_FREE !== '1';
+/** Look-ahead candidates per roll, as in the app (0: play the first continuation, no search). */
+const SEARCH = STEERING ? Number(process.env.DIAG_SEARCH ?? 12) : 0;
 const hull = createDieShape().vertices.map((v) => new Vector3(v.x, v.y, v.z));
 
 function pct(xs: number[], p: number) {
@@ -40,14 +43,29 @@ test('simulation diagnostics', () => {
     let caught = 0;
     let nudges = 0;
     let scripted = 0;
+    let scriptedFromRest = 0;
+    let rollsWithout = 0;
+    const searchMs: number[] = [];
     const random = seededVisualRandom(1234 + name.length);
     let start = gridLayout(SYMBOL_IDS, dims);
     for (let r = 0; r < N; r++) {
       const faces = Array.from({ length: 6 }, () => SYMBOL_IDS[Math.floor(random() * 6)]) as unknown as Faces;
+      const seed = Math.floor(random() * 2 ** 32);
+      let chosen: number | null = null;
+      if (SEARCH > 0) {
+        const s0 = performance.now();
+        const search = new BranchSearch({ faces, dims, start: posesToPlain(start), seed, candidates: branchCandidates(seed, SEARCH) });
+        const { best } = search.run();
+        searchMs.push(performance.now() - s0);
+        chosen = best!.seed;
+      }
       const t0 = performance.now();
-      const sim = new DiceSimulation(faces, dims, start, { random, steering: STEERING });
+      const sim = new DiceSimulation(faces, dims, start, { seed, steering: STEERING });
+      if (chosen !== null) sim.chooseBranch(chosen);
       sim.runToEnd();
       ms.push(performance.now() - t0);
+      scriptedFromRest += sim.stats.scriptedFromRest;
+      if (sim.stats.scriptedRecoveries === 0) rollsWithout++;
       restTimes.push(sim.restAt ?? 99);
       tumblesSteered += sim.stats.steeredTumbles;
       caught += sim.stats.caught;
@@ -116,9 +134,10 @@ test('simulation diagnostics', () => {
         ` | path/die ${f(pct(paths, 0.5))} (min die p10 ${f(pct(minPaths, 0.1))}) coverage ${f(pct(coverage, 0.5))}` +
         ` | wall ${pct(walls, 0.5)} die ${pct(dieHits, 0.5)} flips/die ${f(pct(tumbles, 0.5))} maxH ${f(pct(heights, 0.9))}` +
         ` | wrong ${wrong} pen floor/wall/die ${floorPen}/${wallPen}/${diePen}` +
-        ` | per roll: steered ${f(tumblesSteered / N)} caught ${f(caught / N)} nudges ${f(nudges / N)} scripted ${f(scripted / N)}` +
-        ` | ${f(pct(ms, 0.5))}ms/roll`,
+        ` | per roll: steered ${f(tumblesSteered / N)} caught ${f(caught / N)} nudges ${f(nudges / N)} scripted ${f(scripted / N)} (from rest ${f(scriptedFromRest / N)}; ${Math.round((rollsWithout / N) * 100)}% of rolls none)` +
+        ` | ${f(pct(ms, 0.5))}ms/roll` +
+        (searchMs.length ? ` | search p50 ${pct(searchMs, 0.5).toFixed(0)}ms p90 ${pct(searchMs, 0.9).toFixed(0)}ms` : ''),
     );
   }
-  process.stdout.write(`\n${STEERING ? 'STEERED' : 'FREE'} x${N}\n${lines.join('\n')}\n`);
+  process.stdout.write(`\n${STEERING ? `STEERED, look-ahead ${SEARCH}` : 'FREE'} x${N}\n${lines.join('\n')}\n`);
 }, 600000);

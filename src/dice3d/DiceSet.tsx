@@ -6,11 +6,14 @@ import { soundEngine } from '../audio/soundEngine';
 import { countFaces, type Faces, type RollRecord } from '../game/roll';
 import { ROLL_TIMING } from '../game/rollTiming';
 import { SYMBOL_IDS, type SymbolId } from '../game/symbols';
+import { branchCandidates, posesToPlain } from './branchSearch';
+import type { BranchWorkerReply, BranchWorkerRequest } from './branchWorker';
 import { createDiceResources } from './diceResources';
 import { DiceSimulation, type DiePose } from './diceSimulation';
 import { FACE_LAYOUT, restQuaternion, upwardFace } from './faceMap';
 import { clonePoses, fitPosesToTray, gridLayout } from './layout';
 import { DIE_HALF, type TrayDims } from './trayConfig';
+import { visualRandom } from './visualRandom';
 
 declare global {
   interface Window {
@@ -24,6 +27,13 @@ declare global {
       paths: number[];
       impacts: { die: number; wall: number; felt: number };
       stats: unknown;
+      lookAhead: {
+        tried: number;
+        best: { seed: number; score: number } | null;
+        decidedBy: string | null;
+        /** The worker's replay reached exactly the state this roll had at the branch point. */
+        consistent: boolean | null;
+      } | null;
     };
   }
 }
@@ -36,6 +46,12 @@ const LEAD = 1 / 60;
  * instead of skipping, and a single long stall never triggers a burst of work.
  */
 const PHYSICS_BUDGET_MS = 6;
+/** Continuations the look-ahead may try per roll (branchSearch.ts); it stops early on a perfect one. */
+const LOOKAHEAD_CANDIDATES = 12;
+/** When playback gets this close to the branch point, the best continuation found so far is taken. */
+const DECIDE_AHEAD = 0.1;
+/** Dev-only `?lookahead=0`: play the first continuation without searching (for comparison). */
+const LOOKAHEAD = !(import.meta.env.DEV && typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('lookahead') === '0');
 /** Dev-only `?slowmo=N`: play rolls N times slower, for frame-by-frame inspection. */
 const SLOWMO = (() => {
   if (!import.meta.env.DEV || typeof window === 'undefined') return 1;
@@ -57,7 +73,27 @@ interface LiveRoll {
   settlingSent: boolean;
   /** Last keep-alive sent to the store's watchdog. */
   lastAlive: number;
+  /** Look-ahead search for this roll (null: none, the simulation picks its own continuation). */
+  lookAhead: LookAhead | null;
 }
+
+interface LookAhead {
+  id: number;
+  candidates: number[];
+  /** Continuation chosen; the simulation may run past the branch point. */
+  decided: boolean;
+  /** search: the worker finished; deadline: playback got close; fallback: no result; hidden: tab hidden. */
+  decidedBy: 'search' | 'deadline' | 'fallback' | 'hidden' | null;
+  /** The worker has settled every candidate, or failed: decide at the next frame. */
+  finished: boolean;
+  best: { seed: number; score: number } | null;
+  tried: number;
+  /** Fingerprint of the worker's replay at the branch point. */
+  baseHash: number | null;
+}
+
+/** Ids of look-ahead searches, so late replies for an earlier roll are ignored. */
+let lookAheadSeq = 0;
 
 /** Sound session of the most recent 3D roll (see soundEngine.release). */
 let soundToken = -1;
@@ -88,7 +124,9 @@ function smooth(x: number): number {
  * A roll plays a live DiceSimulation (diceSimulation.ts): each frame advances
  * the fixed-step physics a little ahead of the clock, draws the interpolated
  * poses, trembles the tray by the same shake signal that drives the physics,
- * and hands new collisions to the sound engine. When the simulation confirms
+ * and hands new collisions to the sound engine. Meanwhile a worker replays
+ * the roll and tries continuations from the branch point (branchSearch.ts);
+ * the best one found is played from there. When the simulation confirms
  * all six dice at rest on their recorded faces, the store is told
  * (completeRoll → revealing) and the reveal plays: a short hold, then warm
  * halos under dice whose symbol came up more than once, with a one-time glow
@@ -112,6 +150,7 @@ export function DiceSet({
   const dimsRef = useRef(dims);
   const reducedRef = useRef(reducedMotion);
   const liveRef = useRef<LiveRoll | null>(null);
+  const workerRef = useRef<Worker | null>(null);
   const revealRef = useRef<Reveal | null>(null);
   const handledRef = useRef<string | null>(null);
   const shownFacesRef = useRef<readonly SymbolId[] | null>(null);
@@ -200,11 +239,78 @@ export function DiceSet({
     };
 
     /**
+     * Look-ahead (branchSearch.ts). At roll start the worker gets everything
+     * needed to replay this roll (faces, tray, starting poses, seed) and tries
+     * continuations from the branch point while playback runs; playback waits
+     * for nothing. The simulation holds at the branch point until a
+     * continuation is chosen: the best found when the worker finishes, or when
+     * playback gets close, whichever comes first.
+     */
+    const startSearch = (live: LiveRoll, seed: number, start: readonly DiePose[]) => {
+      const look = live.lookAhead!;
+      const sim = live.sim!;
+      try {
+        const message: BranchWorkerRequest = {
+          type: 'search',
+          id: look.id,
+          request: {
+            faces: live.roll.faces,
+            dims: { halfWidth: sim.dims.halfWidth, halfDepth: sim.dims.halfDepth },
+            start: posesToPlain(start),
+            seed,
+            candidates: look.candidates,
+          },
+        };
+        workerRef.current!.postMessage(message);
+      } catch (error) {
+        console.warn('[dice] look-ahead unavailable for this roll', error);
+        look.finished = true;
+      }
+    };
+
+    const decide = (live: LiveRoll, by: NonNullable<LookAhead['decidedBy']>) => {
+      const look = live.lookAhead!;
+      look.decided = true;
+      look.decidedBy = by;
+      live.sim!.chooseBranch(look.best?.seed ?? look.candidates[0]);
+      cancelSearch(live);
+    };
+
+    const cancelSearch = (live: LiveRoll) => {
+      const look = live.lookAhead;
+      if (!look || look.finished) return;
+      look.finished = true;
+      const message: BranchWorkerRequest = { type: 'cancel', id: look.id };
+      workerRef.current?.postMessage(message);
+    };
+
+    const onSearchReply = (reply: BranchWorkerReply) => {
+      const look = liveRef.current?.lookAhead;
+      if (!look || reply.id !== look.id || look.decided) return;
+      if (reply.error) {
+        console.warn('[dice] look-ahead failed; playing the first continuation', reply.error);
+        look.finished = true;
+        return;
+      }
+      if (reply.best) look.best = reply.best;
+      if (reply.tried !== undefined) look.tried = reply.tried;
+      if (reply.baseHash != null) look.baseHash = reply.baseHash;
+      if (reply.done) look.finished = true;
+    };
+
+    /** The worker could not start or crashed: rolls go on without the look-ahead. */
+    const onSearchUnavailable = () => {
+      const look = liveRef.current?.lookAhead;
+      if (look && !look.decided) look.finished = true;
+    };
+
+    /**
      * Dice are confirmed at rest on the recorded faces: hand over to the reveal.
      * `silent` (tab hidden) skips the chime, which would otherwise sound in the
      * background or whenever the user comes back.
      */
     const finishLive = (live: LiveRoll, now: number, silent = false) => {
+      cancelSearch(live);
       const final = live.sim ? live.sim.finalPoses() : live.reduced!.to;
       restRef.current = clonePoses(final);
       liveRef.current = null;
@@ -229,6 +335,15 @@ export function DiceSet({
             felt: live.sim?.impacts.filter((e) => e.surface === 'felt').length ?? 0,
           },
           stats: live.sim?.stats ?? null,
+          lookAhead: live.lookAhead && {
+            tried: live.lookAhead.tried,
+            best: live.lookAhead.best,
+            decidedBy: live.lookAhead.decidedBy,
+            consistent:
+              live.lookAhead.baseHash === null || live.sim?.branchPointHash == null
+                ? null
+                : live.lookAhead.baseHash === live.sim.branchPointHash,
+          },
         };
       }
       invalidate();
@@ -252,10 +367,27 @@ export function DiceSet({
             heard: 0,
             settlingSent: false,
             lastAlive: 0,
+            lookAhead: null,
           };
         } else {
-          const sim = new DiceSimulation(roll.faces, dimsRef.current, from);
-          liveRef.current = { roll, sim, reduced: null, start: null, heard: 0, settlingSent: false, lastAlive: 0 };
+          const seed = Math.floor(visualRandom() * 2 ** 32);
+          const sim = new DiceSimulation(roll.faces, dimsRef.current, from, { seed });
+          const lookAhead: LookAhead | null =
+            LOOKAHEAD && workerRef.current
+              ? {
+                  id: ++lookAheadSeq,
+                  candidates: branchCandidates(seed, LOOKAHEAD_CANDIDATES),
+                  decided: false,
+                  decidedBy: null,
+                  finished: false,
+                  best: null,
+                  tried: 0,
+                  baseHash: null,
+                }
+              : null;
+          const live: LiveRoll = { roll, sim, reduced: null, start: null, heard: 0, settlingSent: false, lastAlive: 0, lookAhead };
+          liveRef.current = live;
+          if (lookAhead) startSearch(live, seed, from);
         }
       } catch (error) {
         // Last resort: show the already-recorded result in place and release the UI.
@@ -278,6 +410,7 @@ export function DiceSet({
       const live = liveRef.current;
       if (!live) return;
       soundEngine.release(soundToken);
+      if (live.lookAhead && !live.lookAhead.decided) decide(live, 'hidden');
       if (live.sim) {
         live.sim.runToEnd();
         live.sim.repair(live.sim.wrongDice());
@@ -302,7 +435,13 @@ export function DiceSet({
 
         if (live.sim) {
           const sim = live.sim;
-          sim.advanceTo(t + LEAD, now + PHYSICS_BUDGET_MS);
+          const look = live.lookAhead;
+          if (look && !look.decided && (look.finished || t >= ROLL_TIMING.branchAt - DECIDE_AHEAD)) {
+            decide(live, !look.finished ? 'deadline' : look.best ? 'search' : 'fallback');
+          }
+          // Never past the branch point before a continuation is chosen.
+          const target = look && !look.decided ? Math.min(t + LEAD, ROLL_TIMING.branchAt) : t + LEAD;
+          sim.advanceTo(target, now + PHYSICS_BUDGET_MS);
           if (now - live.lastAlive > 1000) {
             live.lastAlive = now;
             rollStore.keepAlive(live.roll.id);
@@ -320,9 +459,11 @@ export function DiceSet({
           sim.shake.offset(shown, offset);
           rig.current?.position.set(offset.x, 0, offset.z);
 
-          // Collisions that have now been simulated, scheduled at their exact time.
+          // Collisions due within the next moment of playback, scheduled at their
+          // exact time (the simulation itself may be further ahead, see look-ahead).
           const impacts = sim.impacts;
-          while (live.heard < impacts.length && impacts[live.heard].t <= sim.time) {
+          const horizon = Math.min(sim.time, t + LEAD);
+          while (live.heard < impacts.length && impacts[live.heard].t <= horizon) {
             const e = impacts[live.heard++];
             const delay = e.t - t;
             if (delay > -0.05) soundEngine.impact(Math.max(0, delay), e.strength, e.surface, e.die);
@@ -400,7 +541,16 @@ export function DiceSet({
       invalidate();
     };
 
-    return { applyRest, frame, syncWithStore, finishNow, relayout, refresh: () => invalidate() };
+    return {
+      applyRest,
+      frame,
+      syncWithStore,
+      finishNow,
+      relayout,
+      onSearchReply,
+      onSearchUnavailable,
+      refresh: () => invalidate(),
+    };
   }, [invalidate, resources, rig]);
 
   useEffect(() => {
@@ -431,6 +581,33 @@ export function DiceSet({
   }, [controller]);
 
   useEffect(() => () => resources.dispose(), [resources]);
+
+  useEffect(() => {
+    // The look-ahead worker starts with the tray, so it is warm by the first roll.
+    // Without it (unsupported, blocked, crashed) rolls simply skip the search.
+    // A single-core device would pay for the search in dropped frames.
+    if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency === 1) return;
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./branchWorker.ts', import.meta.url), { type: 'module' });
+    } catch (error) {
+      console.warn('[dice] look-ahead worker unavailable', error);
+      return;
+    }
+    worker.onmessage = (event: MessageEvent<BranchWorkerReply>) => controller.onSearchReply(event.data);
+    worker.onerror = (event) => {
+      event.preventDefault();
+      console.warn('[dice] look-ahead worker failed', event.message);
+      if (workerRef.current === worker) workerRef.current = null;
+      worker.terminate();
+      controller.onSearchUnavailable();
+    };
+    workerRef.current = worker;
+    return () => {
+      if (workerRef.current === worker) workerRef.current = null;
+      worker.terminate();
+    };
+  }, [controller]);
 
   useFrame(controller.frame);
 
